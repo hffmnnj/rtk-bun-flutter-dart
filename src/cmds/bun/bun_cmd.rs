@@ -381,25 +381,60 @@ fn filter_bun_build(output: &str) -> String {
 }
 
 fn filter_bun_run(output: &str) -> String {
-    let mut result = Vec::new();
+    let command_echoes: Vec<String> = output
+        .lines()
+        .map(strip_ansi)
+        .filter(|l| !l.trim().is_empty() && (l.starts_with('>') || l.starts_with('$')))
+        .collect();
+    let command_echoes_present = !command_echoes.is_empty();
+    let mut status_lines: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut saw_done = false;
     for line in output.lines() {
         let clean = strip_ansi(line);
         if clean.trim().is_empty() {
             continue;
         }
+        if clean.starts_with('>') || clean.starts_with('$') {
+            continue;
+        }
         let lower = clean.to_lowercase();
-        if lower.contains("error")
-            || lower.contains("warn")
-            || clean.starts_with(">")
-            || clean.starts_with("$")
+        if lower.contains("error") {
+            errors.push(clean.clone());
+        } else if lower.contains("warn") {
+            warnings.push(clean.clone());
+        } else if lower.contains("done")
+            || lower.contains("finished")
+            || lower.contains("success")
+            || lower.contains("built")
         {
-            result.push(clean);
+            saw_done = true;
+            status_lines.push(clean.clone());
         }
     }
-    if result.is_empty() {
-        "ok".to_string()
-    } else {
+
+    let mut result = Vec::new();
+    let has_problems = !errors.is_empty() || !warnings.is_empty();
+    if has_problems {
+        result.extend(command_echoes);
+        result.extend(status_lines);
+        if !errors.is_empty() {
+            result.push("---".to_string());
+            result.extend(errors);
+        }
+        if !warnings.is_empty() {
+            result.push("---".to_string());
+            result.extend(warnings);
+        }
         result.join("\n")
+    } else {
+        // No errors or warnings: the script executed successfully.
+        if saw_done || command_echoes_present {
+            "finished".to_string()
+        } else {
+            "ok".to_string()
+        }
     }
 }
 
@@ -457,5 +492,17 @@ mod tests {
         let res = filter_bun_run(out);
         assert!(res.contains("Error"));
         assert!(!res.contains("Starting"));
+    }
+
+    #[test]
+    fn test_filter_bun_run_finished() {
+        let out = "$ bun run --cwd packages/opencode-plugin build\n$ bun build ./src/index.ts --outdir ./dist --target bun";
+        assert_eq!(filter_bun_run(out), "finished");
+    }
+
+    #[test]
+    fn test_filter_bun_run_done_output() {
+        let out = " Building...\n done";
+        assert_eq!(filter_bun_run(out), "finished");
     }
 }
