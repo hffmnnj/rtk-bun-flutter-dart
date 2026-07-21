@@ -7,8 +7,11 @@ mod learn;
 mod parser;
 
 // Re-export command modules for routing
+use cmds::bun::bun_cmd;
 use cmds::cloud::{aws_cmd, container, curl_cmd, psql_cmd, wget_cmd};
+use cmds::dart::dart_cmd;
 use cmds::dotnet::{binlog, dotnet_cmd, dotnet_format_report, dotnet_trx};
+use cmds::flutter::flutter_cmd;
 use cmds::git::{diff_cmd, gh_cmd, git, glab_cmd, gt_cmd};
 use cmds::go::{go_cmd, golangci_cmd};
 use cmds::js::{
@@ -566,6 +569,31 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// bunx with intelligent routing (tsc, eslint, prettier -> specialized filters)
+    Bunx {
+        /// bunx arguments (command + options)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Bun runtime commands with compact output
+    Bun {
+        #[command(subcommand)]
+        command: BunCommands,
+    },
+
+    /// Dart SDK commands with compact output
+    Dart {
+        #[command(subcommand)]
+        command: DartCommands,
+    },
+
+    /// Flutter SDK commands with compact output
+    Flutter {
+        #[command(subcommand)]
+        command: FlutterCommands,
+    },
+
     /// Curl with auto-JSON detection and schema output
     Curl {
         /// Curl arguments (URL + options)
@@ -955,6 +983,132 @@ enum GitCommands {
     /// Passthrough: runs any unsupported git subcommand directly
     #[command(external_subcommand)]
     Other(Vec<OsString>),
+}
+
+#[derive(Debug, Subcommand)]
+enum BunCommands {
+    /// Run tests and show only failures
+    Test {
+        /// Additional bun test arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run a script and strip lifecycle noise
+    Run {
+        /// Script name + arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Install dependencies and strip download noise
+    Install {
+        /// Additional bun install arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Add dependencies and strip download noise
+    Add {
+        /// Package names + arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Remove dependencies and strip download noise
+    Remove {
+        /// Package names + arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Update dependencies and strip lockfile churn
+    Update {
+        /// Additional bun update arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Package manager subcommands (ls, hash, migrate)
+    Pm {
+        /// Subcommand + arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Bundle code and strip per-file status spam
+    Build {
+        /// Additional bun build arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Create a project scaffold and keep essential output
+    Create {
+        /// Template + arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Initialize a project and keep essential output
+    Init {
+        /// Additional bun init arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Execute a package (tsc/eslint/prettier route to rtk filters)
+    Bunx {
+        /// Package + arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DartCommands {
+    /// Get/upgrade/add Dart packages with compact output
+    Pub {
+        /// Subcommand + arguments (e.g. get, add, upgrade)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run `dart analyze` and group lint issues by file
+    Analyze {
+        /// Additional dart analyze arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run `dart test` and show only failures
+    Test {
+        /// Additional dart test arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run a Dart program and keep errors/warnings
+    Run {
+        /// Additional dart run arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FlutterCommands {
+    /// Get/upgrade/add Flutter packages with compact output
+    Pub {
+        /// Subcommand + arguments (e.g. get, add, upgrade)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run `flutter analyze` and group lint issues by file
+    Analyze {
+        /// Additional flutter analyze arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run `flutter test` and show only failures
+    Test {
+        /// Additional flutter test arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Build a Flutter app and strip per-target status spam
+    Build {
+        /// Additional flutter build arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2219,6 +2373,36 @@ fn run_cli() -> Result<i32> {
 
         Commands::Npm { args } => npm_cmd::run(&args, cli.verbose, cli.skip_env)?,
 
+        Commands::Bun { command } => match command {
+            BunCommands::Test { args } => bun_cmd::run_bun_test(&args, cli.verbose)?,
+            BunCommands::Run { args } => bun_cmd::run_bun_run(&args, cli.verbose)?,
+            BunCommands::Install { args } => bun_cmd::run_bun_install(&args, cli.verbose)?,
+            BunCommands::Add { args } => bun_cmd::run_bun_add(&args, cli.verbose)?,
+            BunCommands::Remove { args } => bun_cmd::run_bun_remove(&args, cli.verbose)?,
+            BunCommands::Update { args } => bun_cmd::run_bun_update(&args, cli.verbose)?,
+            BunCommands::Pm { args } => bun_cmd::run_bun_pm(&args, cli.verbose)?,
+            BunCommands::Build { args } => bun_cmd::run_bun_build(&args, cli.verbose)?,
+            BunCommands::Create { args } => bun_cmd::run_bun_create(&args, cli.verbose)?,
+            BunCommands::Init { args } => bun_cmd::run_bun_init(&args, cli.verbose)?,
+            BunCommands::Bunx { args } => bun_cmd::run_bunx(&args, cli.verbose)?,
+        },
+
+        Commands::Dart { command } => match command {
+            DartCommands::Pub { args } => dart_cmd::run_dart_pub(&args, cli.verbose)?,
+            DartCommands::Analyze { args } => dart_cmd::run_dart_analyze(&args, cli.verbose)?,
+            DartCommands::Test { args } => dart_cmd::run_dart_test(&args, cli.verbose)?,
+            DartCommands::Run { args } => dart_cmd::run_dart_run(&args, cli.verbose)?,
+        },
+
+        Commands::Flutter { command } => match command {
+            FlutterCommands::Pub { args } => flutter_cmd::run_flutter_pub(&args, cli.verbose)?,
+            FlutterCommands::Analyze { args } => {
+                flutter_cmd::run_flutter_analyze(&args, cli.verbose)?
+            }
+            FlutterCommands::Test { args } => flutter_cmd::run_flutter_test(&args, cli.verbose)?,
+            FlutterCommands::Build { args } => flutter_cmd::run_flutter_build(&args, cli.verbose)?,
+        },
+
         Commands::Curl { args } => curl_cmd::run(&args, cli.verbose)?,
 
         Commands::Discover {
@@ -2318,6 +2502,13 @@ fn run_cli() -> Result<i32> {
                 "playwright" => playwright_cmd::run(&args[1..], cli.verbose)?,
                 _ => npm_cmd::exec(&args, cli.verbose, cli.skip_env)?,
             }
+        }
+
+        Commands::Bunx { args } => {
+            if args.is_empty() {
+                anyhow::bail!("bunx requires a command argument");
+            }
+            bun_cmd::run_bunx(&args, cli.verbose)?
         }
 
         Commands::Ruff { args } => ruff_cmd::run(&args, cli.verbose)?,
@@ -2709,6 +2900,10 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Cargo { .. }
             | Commands::Npm { .. }
             | Commands::Npx { .. }
+            | Commands::Bunx { .. }
+            | Commands::Bun { .. }
+            | Commands::Dart { .. }
+            | Commands::Flutter { .. }
             | Commands::Curl { .. }
             | Commands::Ruff { .. }
             | Commands::Pytest { .. }
@@ -3091,6 +3286,10 @@ mod tests {
             "cargo",
             "npm",
             "npx",
+            "bunx",
+            "bun",
+            "dart",
+            "flutter",
             "curl",
             "ruff",
             "pytest",
@@ -3575,6 +3774,58 @@ mod tests {
                 assert!(global);
             }
             _ => panic!("Expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_bun_test_parses() {
+        let cli = Cli::try_parse_from(["rtk", "bun", "test", "--watch"]).unwrap();
+        match cli.command {
+            Commands::Bun {
+                command: BunCommands::Test { args },
+            } => {
+                assert_eq!(args, vec!["--watch"]);
+            }
+            _ => panic!("Expected Bun Test command"),
+        }
+    }
+
+    #[test]
+    fn test_bunx_parses() {
+        let cli = Cli::try_parse_from(["rtk", "bun", "bunx", "tsc", "--noEmit"]).unwrap();
+        match cli.command {
+            Commands::Bun {
+                command: BunCommands::Bunx { args },
+            } => {
+                assert_eq!(args, vec!["tsc", "--noEmit"]);
+            }
+            _ => panic!("Expected Bun Bunx command"),
+        }
+    }
+
+    #[test]
+    fn test_flutter_pub_get_parses() {
+        let cli = Cli::try_parse_from(["rtk", "flutter", "pub", "get"]).unwrap();
+        match cli.command {
+            Commands::Flutter {
+                command: FlutterCommands::Pub { args },
+            } => {
+                assert_eq!(args, vec!["get"]);
+            }
+            _ => panic!("Expected Flutter Pub command"),
+        }
+    }
+
+    #[test]
+    fn test_dart_analyze_parses() {
+        let cli = Cli::try_parse_from(["rtk", "dart", "analyze"]).unwrap();
+        match cli.command {
+            Commands::Dart {
+                command: DartCommands::Analyze { args },
+            } => {
+                assert!(args.is_empty());
+            }
+            _ => panic!("Expected Dart Analyze command"),
         }
     }
 }

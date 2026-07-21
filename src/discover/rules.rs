@@ -997,6 +997,42 @@ pub const RULES: &[RtkRule] = &[
         subcmd_savings: &[],
         subcmd_status: &[],
     },
+    RtkRule {
+        pattern: r"^bun\s+(test|run|install|i|add|remove|rm|update|up|pm|build|create|init|x|bunx)",
+        rtk_cmd: "rtk bun",
+        rewrite_prefixes: &["bun"],
+        category: "PackageManager",
+        savings_pct: 80.0,
+        subcmd_savings: &[("test", 90.0), ("build", 85.0), ("install", 80.0)],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        pattern: r"^bunx\s+",
+        rtk_cmd: "rtk bunx",
+        rewrite_prefixes: &["bunx"],
+        category: "PackageManager",
+        savings_pct: 75.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        pattern: r"^dart\s+(pub|analyze|analyse|test|run)",
+        rtk_cmd: "rtk dart",
+        rewrite_prefixes: &["dart"],
+        category: "Build",
+        savings_pct: 75.0,
+        subcmd_savings: &[("analyze", 85.0), ("test", 90.0)],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        pattern: r"^flutter\s+(pub|analyze|analyse|test|build)",
+        rtk_cmd: "rtk flutter",
+        rewrite_prefixes: &["flutter"],
+        category: "Build",
+        savings_pct: 80.0,
+        subcmd_savings: &[("analyze", 85.0), ("test", 90.0), ("build", 75.0)],
+        subcmd_status: &[],
+    },
 ];
 
 pub const IGNORED_PREFIXES: &[&str] = &[
