@@ -36,6 +36,8 @@
 
 rtk filters and compresses command outputs before they reach your LLM context. Single Rust binary, 100+ supported commands, <10ms overhead.
 
+**This fork adds Bun, Dart, and Flutter support.** Install from `github.com/hffmnnj/rtk-bun-flutter-dart`.
+
 ## Token Savings (30-min Claude Code Session)
 
 | Operation | Frequency | Standard | rtk | Savings |
@@ -48,13 +50,16 @@ rtk filters and compresses command outputs before they reach your LLM context. S
 | `git log` | 5x | 2,500 | 500 | -80% |
 | `git add/commit/push` | 8x | 1,600 | 120 | -92% |
 | `cargo test` / `npm test` | 5x | 25,000 | 2,500 | -90% |
+| `bun test` | 6x | 18,000 | 1,800 | -90% |
+| `flutter test` | 4x | 16,000 | 2,400 | -85% |
+| `dart test` | 3x | 12,000 | 1,800 | -85% |
 | `ruff check` | 3x | 3,000 | 600 | -80% |
 | `pytest` | 4x | 8,000 | 800 | -90% |
 | `go test` | 3x | 6,000 | 600 | -90% |
 | `docker ps` | 3x | 900 | 180 | -80% |
 | **Total** | | **~118,000** | **~23,900** | **-80%** |
 
-> Estimates based on medium-sized TypeScript/Rust projects. Actual savings vary by project size.
+> Estimates based on medium-sized TypeScript/Rust/Flutter projects. Actual savings vary by project size and error count.
 
 ## Installation
 
@@ -64,11 +69,15 @@ rtk filters and compresses command outputs before they reach your LLM context. S
 brew install rtk
 ```
 
+> **Note:** This fork is not on Homebrew. To use Bun / Dart / Flutter support, build from source (see Cargo below).
+
 ### Quick Install (Linux/macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/hffmnnj/rtk-bun-flutter-dart/HEAD/install.sh | sh
 ```
+
+> Fork install. For upstream RTK, use `rtk-ai/rtk`.
 
 > Installs to `~/.local/bin`. Add to PATH if needed:
 > ```bash
@@ -78,7 +87,7 @@ curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/instal
 ### Cargo
 
 ```bash
-cargo install --git https://github.com/rtk-ai/rtk
+cargo install --git https://github.com/hffmnnj/rtk-bun-flutter-dart
 ```
 
 ### Pre-built Binaries
@@ -176,6 +185,8 @@ rtk gh run list                 # Workflow run status
 
 ### Test Runners
 ```bash
+rtk bun test                      # Bun tests (failures only, -90%)
+rtk bunx vitest                   # Bunx package execution with routing
 rtk jest                        # Jest compact (failures only)
 rtk vitest                      # Vitest compact (failures only)
 rtk playwright test             # E2E results (failures only)
@@ -184,6 +195,8 @@ rtk go test                     # Go tests (NDJSON, -90%)
 rtk cargo test                  # Cargo tests (-90%)
 rtk rake test                   # Ruby minitest (-90%)
 rtk rspec                       # RSpec tests (JSON, -60%+)
+rtk flutter test                # Flutter tests (failures only, -85%)
+rtk dart test                   # Dart tests (failures only, -85%)
 rtk err <cmd>                   # Filter errors only from any command
 rtk test <cmd>                  # Generic test wrapper - failures only (-90%)
 ```
@@ -200,16 +213,23 @@ rtk cargo clippy                # Cargo clippy (-80%)
 rtk ruff check                  # Python linting (JSON, -80%)
 rtk golangci-lint run           # Go linting (JSON, -85%)
 rtk rubocop                     # Ruby linting (JSON, -60%+)
+rtk bun build                   # Bun bundler (errors/success only, -80%)
+rtk flutter build apk           # Flutter builds (progress suppressed, -70%)
+rtk flutter analyze             # Flutter analyze (deduplicated, -80%)
+rtk dart analyze                # Dart analyze (deduplicated, -80%)
 ```
 
 ### Package Managers
 ```bash
+rtk bun install                   # Bun install (summary only, -70%)
 rtk pnpm list                   # Compact dependency tree
 rtk uv run pytest               # Preserve uv env, errors only
 rtk pip list                    # Python packages (auto-detect uv)
 rtk pip outdated                # Outdated packages
 rtk bundle install              # Ruby gems (strip Using lines)
 rtk prisma generate             # Schema generation (no ASCII art)
+rtk flutter pub get             # Flutter deps (success/failure, -60%)
+rtk dart pub get                # Dart deps (success/failure, -60%)
 ```
 
 ### AWS
