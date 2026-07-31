@@ -266,7 +266,16 @@ impl BlockHandler for BunTestHandler {
             self.passed += 1;
             self.context_buffer.clear();
             false
-        } else if clean.contains("(skip)") || clean.contains("skip") {
+        } else if clean.contains("(skip)")
+            || clean.contains(" → skip")
+            || clean.trim_start().starts_with("↓")
+        {
+            // Conservative skip detection: only count bun's own skip
+            // markers. The previous `clean.contains("skip")` was a
+            // substring match that fired on arbitrary words like
+            // `skipped="0"` in JUnit XML, which made every non-default
+            // reporter register as "1 skipped" and broke the no-output
+            // fallback.
             self.skipped += 1;
             false
         } else {
@@ -286,8 +295,26 @@ impl BlockHandler for BunTestHandler {
         clean.starts_with("  ") || clean.starts_with('\t') || clean.starts_with("at ")
     }
 
-    fn format_summary(&self, _exit_code: i32, _raw: &str) -> Option<String> {
-        if self.failed == 0 && self.passed == 0 && self.skipped == 0 {
+    fn format_summary(&self, exit_code: i32, raw: &str) -> Option<String> {
+        // If we saw no (pass)/(fail)/(skip) markers but the raw output is
+        // non-empty, we are likely looking at a non-default reporter (TAP,
+        // JUnit, dots) or a bun error (e.g. "no test files matched"). In
+        // those cases our counters are zero but the user still needs to see
+        // what bun actually said — return None so the runner can fall back
+        // to the raw output instead of emitting a misleading "no output".
+        let raw_trimmed = raw.trim();
+        let counters_zero =
+            self.failed == 0 && self.passed == 0 && self.skipped == 0;
+        if counters_zero && !raw_trimmed.is_empty() {
+            return None;
+        }
+        if counters_zero {
+            // Raw output is also empty. Distinguish success (truly nothing
+            // to test) from failure (e.g. missing bun binary, permission
+            // error) via the exit code so the user can act.
+            if exit_code != 0 {
+                return Some(format!("bun test: no output (exit {})", exit_code));
+            }
             return Some("bun test: no output".to_string());
         }
         let mut lines = vec![format!(
@@ -299,6 +326,17 @@ impl BlockHandler for BunTestHandler {
             lines.push(failure.clone());
         }
         Some(lines.join("\n"))
+    }
+
+    /// Hint used by the runner to decide whether the streamed filter output
+    /// is too low-information to be useful. When this is true, the runner
+    /// falls back to the raw output instead of the filter's summary.
+    fn low_info(&self, raw: &str) -> bool {
+        // No markers matched AND raw output is non-empty → filter could not
+        // classify anything; the raw output is the truth.
+        let counters_zero =
+            self.failed == 0 && self.passed == 0 && self.skipped == 0;
+        counters_zero && !raw.trim().is_empty()
     }
 }
 
@@ -504,5 +542,132 @@ mod tests {
     fn test_filter_bun_run_done_output() {
         let out = " Building...\n done";
         assert_eq!(filter_bun_run(out), "finished");
+    }
+
+    // ---- BunTestHandler regression tests for the "no output" bug ----
+    //
+    // Bug: when `bun test` runs against a non-default reporter (TAP, JUnit)
+    // or an empty/unmatched directory, the handler never saw a `(pass)` /
+    // `(fail)` marker so all counters stayed at zero. `format_summary`
+    // then returned the literal string `"bun test: no output"`, hiding the
+    // actual bun output. The fix returns `None` (and `low_info` returns
+    // `true`) so the stream layer falls back to the raw output.
+
+    fn drive_bun_test_handler(input: &str, exit_code: i32) -> (Option<String>, bool) {
+        use crate::core::stream::{BlockStreamFilter, StreamFilter};
+        let mut f = BlockStreamFilter::new(BunTestHandler::new());
+        for line in input.lines() {
+            let _ = f.feed_line(line);
+        }
+        let _ = f.flush();
+        let raw = input.to_string();
+        let summary = f.on_exit(exit_code, &raw);
+        let low_info = f.low_info(&raw);
+        (summary, low_info)
+    }
+
+    #[test]
+    fn bun_test_handler_default_reporter_passes() {
+        // Default reporter: every line contains "(pass)" so the handler
+        // counts them. Summary should be a clean count.
+        let input = "\
+bun test v1.4.0
+
+group a > adds 1+1:
+(pass) adds 1+1
+(pass) subtracts
+(pass) concatenates
+
+ 3 pass
+ 0 fail
+Ran 3 tests across 1 file. [10ms]";
+        let (summary, low_info) = drive_bun_test_handler(input, 0);
+        assert_eq!(summary.as_deref(), Some("3 passed, 0 failed, 0 skipped"));
+        assert!(!low_info, "default-reporter output is informative");
+    }
+
+    #[test]
+    fn bun_test_handler_tap_reporter_falls_back_to_raw() {
+        // TAP reporter: lines like "ok 1 - test name" / "not ok 2 - other".
+        // No "(pass)" or "(fail)" markers → counters stay at 0.
+        let input = "\
+TAP version 13
+ok 1 - group a > adds 1+1
+ok 2 - group a > subtracts
+ok 3 - group a > concatenates
+1..3
+# tests 3
+# pass  3
+# fail  0";
+        let (summary, low_info) = drive_bun_test_handler(input, 0);
+        // format_summary returns None so the stream layer falls back.
+        assert_eq!(summary, None, "TAP output must yield no synthetic summary");
+        assert!(low_info, "TAP output must be flagged low-info");
+    }
+
+    #[test]
+    fn bun_test_handler_junit_reporter_falls_back_to_raw() {
+        // JUnit XML — no markers the handler recognizes.
+        let input = "\
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<testsuites>
+  <testsuite name=\"repro\" tests=\"2\" failures=\"0\" errors=\"0\" skipped=\"0\">
+    <testcase name=\"adds 1+1\" time=\"0.001\"/>
+    <testcase name=\"subtracts\" time=\"0.001\"/>
+  </testsuite>
+</testsuites>";
+        let (summary, low_info) = drive_bun_test_handler(input, 0);
+        assert_eq!(summary, None, "JUnit output must yield no synthetic summary");
+        assert!(low_info, "JUnit output must be flagged low-info");
+    }
+
+    #[test]
+    fn bun_test_handler_no_matching_test_files_falls_back_to_raw() {
+        // Empty/unmatched directory: bun prints a helpful error.
+        let input = "\
+The following filters did not match any test files:
+ tests/fixtures/
+
+note: Tests need \".test\", \"_test_\", \".spec\" or \"_spec_\" in the filename (ex: \"MyApp.test.ts\")
+
+Learn more about bun test: https://bun.com/docs/cli/test";
+        let (summary, low_info) = drive_bun_test_handler(input, 1);
+        assert_eq!(summary, None, "empty-dir error must yield no synthetic summary");
+        assert!(low_info, "empty-dir error must be flagged low-info");
+    }
+
+    #[test]
+    fn bun_test_handler_truly_empty_output_with_nonzero_exit_includes_code() {
+        // Raw stdout is empty, but exit code is non-zero (e.g. missing
+        // bun binary, permission error). We still want a summary line
+        // that tells the user something went wrong.
+        let (summary, low_info) = drive_bun_test_handler("", 127);
+        assert_eq!(summary.as_deref(), Some("bun test: no output (exit 127)"));
+        assert!(!low_info, "empty output + nonzero exit is itself informative");
+    }
+
+    #[test]
+    fn bun_test_handler_truly_empty_output_with_zero_exit() {
+        let (summary, low_info) = drive_bun_test_handler("", 0);
+        assert_eq!(summary.as_deref(), Some("bun test: no output"));
+        assert!(!low_info);
+    }
+
+    #[test]
+    fn bun_test_handler_mixed_pass_and_fail() {
+        // Sanity: when both pass and fail markers are present we get a
+        // full summary with the failure block attached.
+        let input = "\
+(pass) one
+(fail) two
+  Expected: 1
+  Received: 2
+(pass) three";
+        let (summary, low_info) = drive_bun_test_handler(input, 1);
+        let s = summary.expect("summary present");
+        assert!(s.contains("2 passed"), "got: {s}");
+        assert!(s.contains("1 failed"), "got: {s}");
+        assert!(s.contains("(fail) two"), "failure block included: {s}");
+        assert!(!low_info);
     }
 }

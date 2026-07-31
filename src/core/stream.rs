@@ -12,6 +12,15 @@ pub trait StreamFilter {
     fn on_exit(&mut self, _exit_code: i32, _raw: &str) -> Option<String> {
         None
     }
+    /// Hint for the runner's never-worse guard on the streamed path:
+    /// when the filter collapsed to nothing meaningful but raw output is
+    /// substantial, return `true` so the stream layer falls back to
+    /// printing the raw output instead of an uninformative placeholder.
+    ///
+    /// Default: `false` (trust the filter's `on_exit`).
+    fn low_info(&self, _raw: &str) -> bool {
+        false
+    }
 }
 
 pub trait BlockHandler {
@@ -19,6 +28,17 @@ pub trait BlockHandler {
     fn is_block_start(&mut self, line: &str) -> bool;
     fn is_block_continuation(&mut self, line: &str, block: &[String]) -> bool;
     fn format_summary(&self, exit_code: i32, raw: &str) -> Option<String>;
+
+    /// Hint for the runner's never-worse guard on the streamed path: when
+    /// the filter collapsed to nothing (or near-nothing) but raw output is
+    /// meaningful, return `true` so the runner falls back to printing the
+    /// raw output instead of an uninformative placeholder.
+    ///
+    /// Default: `false` (trust the filter's `format_summary`).
+    #[allow(dead_code)] // forwarded through StreamFilter::low_info by BlockStreamFilter
+    fn low_info(&self, _raw: &str) -> bool {
+        false
+    }
 }
 
 pub struct BlockStreamFilter<H: BlockHandler> {
@@ -83,6 +103,10 @@ impl<H: BlockHandler> StreamFilter for BlockStreamFilter<H> {
     fn on_exit(&mut self, exit_code: i32, raw: &str) -> Option<String> {
         self.handler.format_summary(exit_code, raw)
     }
+
+    fn low_info(&self, raw: &str) -> bool {
+        self.handler.low_info(raw)
+    }
 }
 
 /// Counterpart to [`BlockHandler`] for line-oriented streams.
@@ -98,6 +122,12 @@ pub trait LineHandler {
     fn observe_line(&mut self, _line: &str) {}
 
     fn format_summary(&self, exit_code: i32, raw: &str) -> Option<String>;
+
+    /// Hint for the never-worse guard on the streamed path. See
+    /// [`StreamFilter::low_info`].
+    fn low_info(&self, _raw: &str) -> bool {
+        false
+    }
 }
 
 pub struct LineStreamFilter<H: LineHandler> {
@@ -125,6 +155,10 @@ impl<H: LineHandler> StreamFilter for LineStreamFilter<H> {
 
     fn on_exit(&mut self, exit_code: i32, raw: &str) -> Option<String> {
         self.handler.format_summary(exit_code, raw)
+    }
+
+    fn low_info(&self, raw: &str) -> bool {
+        self.handler.low_info(raw)
     }
 }
 
@@ -491,18 +525,53 @@ pub fn run_streaming(
     let raw = format!("{}{}", raw_stdout, raw_stderr);
 
     if let Some(mut f) = saved_filter {
-        if let Some(post) = f.on_exit(exit_code, &raw) {
-            filtered.push_str(&post);
-            let mut dest: Box<dyn Write> = if filter_fd_is_stderr {
-                Box::new(io::stderr().lock())
+        // The fallback uses raw_stdout first, but tools that write their
+        // important output to stderr (e.g. `bun test --reporter=tap`,
+        // which prints TAP lines to stderr) would otherwise fall through
+        // with nothing to show. Combine both streams.
+        let raw_combined = format!("{}{}", raw_stdout, raw_stderr);
+        let raw_trimmed = raw_combined.trim();
+        // on_exit is &mut self, so we must capture all the signals we
+        // need before invoking it: the handler's `low_info` hint and the
+        // post-exit summary string. Then we can choose what to emit.
+        let filter_uninformative = f.low_info(&raw);
+        let post = f.on_exit(exit_code, &raw);
+        if let Some(post) = post {
+            // Never-worse guard for the streamed path: if the handler's
+            // own check says its summary is uninformative while raw
+            // stdout is meaningful, fall back to printing the raw output
+            // instead of the misleading placeholder.
+            if !raw_trimmed.is_empty() && filter_uninformative {
+                let stdout = io::stdout();
+                let mut dest = stdout.lock();
+                let _ = writeln!(dest, "{}", raw_trimmed);
+                filtered.push_str(raw_trimmed);
+                filtered.push('\n');
             } else {
-                Box::new(io::stdout().lock())
-            };
-            match write!(dest, "{}", post) {
-                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
-                Err(e) => return Err(e.into()),
-                Ok(_) => {}
+                filtered.push_str(&post);
+                let mut dest: Box<dyn Write> = if filter_fd_is_stderr {
+                    Box::new(io::stderr().lock())
+                } else {
+                    Box::new(io::stdout().lock())
+                };
+                match write!(dest, "{}", post) {
+                    Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+                    Err(e) => return Err(e.into()),
+                    Ok(_) => {}
+                }
             }
+        } else if !raw_trimmed.is_empty() && filter_uninformative {
+            // on_exit returned None: handler explicitly opted out of a
+            // summary, presumably because the markers it looks for are
+            // absent. Surface the raw output so the user still sees what
+            // the child printed. Always go to stdout for the fallback:
+            // the user expects filtered output on stdout regardless of
+            // which stream the child happened to use.
+            let stdout = io::stdout();
+            let mut dest = stdout.lock();
+            let _ = writeln!(dest, "{}", raw_trimmed);
+            filtered.push_str(raw_trimmed);
+            filtered.push('\n');
         }
     }
 
@@ -692,6 +761,65 @@ pub(crate) mod tests {
         let result = run_streaming(&mut cmd, StdinMode::Null, FilterMode::Passthrough).unwrap();
         assert_eq!(result.exit_code, 1);
         assert!(!result.success());
+    }
+
+    /// Regression test for the bun test "no output" bug: a child that
+    /// writes its important output to stderr and exits non-zero must
+    /// surface the raw stderr in the result, even when the filter says
+    /// its summary is uninformative. Without the never-worse guard the
+    /// user would see nothing and just get the exit code.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_run_streaming_low_info_falls_back_to_combined_raw() {
+        use crate::core::stream::{BlockStreamFilter, StreamFilter};
+        // A handler that mimics BunTestHandler: no markers matched, but
+        // raw output is non-empty. It must be flagged as low_info so the
+        // runner prints the raw output instead of a placeholder.
+        struct StderrOnlyHandler;
+        impl BlockHandler for StderrOnlyHandler {
+            fn should_skip(&mut self, _line: &str) -> bool {
+                false
+            }
+            fn is_block_start(&mut self, _line: &str) -> bool {
+                false
+            }
+            fn is_block_continuation(&mut self, _line: &str, _b: &[String]) -> bool {
+                false
+            }
+            fn format_summary(&self, _exit_code: i32, _raw: &str) -> Option<String> {
+                Some("SYNTHETIC PLACEHOLDER".to_string())
+            }
+            fn low_info(&self, raw: &str) -> bool {
+                !raw.trim().is_empty()
+            }
+        }
+        // `sh -c 'echo HELLO >&2; exit 7'` writes HELLO to stderr and
+        // exits 7. The handler sees nothing on stdout, but stderr has
+        // the real message.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo HELLO >&2; exit 7"]);
+        let filter: Box<dyn StreamFilter> = Box::new(BlockStreamFilter::new(StderrOnlyHandler));
+        let result =
+            run_streaming(&mut cmd, StdinMode::Null, FilterMode::Streaming(filter)).unwrap();
+        assert_eq!(result.exit_code, 7, "exit code must propagate");
+        assert!(
+            result.raw_stderr.contains("HELLO"),
+            "stderr captured: {:?}",
+            result.raw_stderr
+        );
+        // The filter's `on_exit` returned Some("SYNTHETIC PLACEHOLDER")
+        // but the never-worse guard must have replaced it with the raw
+        // output in `result.filtered` (and in stdout).
+        assert!(
+            result.filtered.contains("HELLO"),
+            "filtered should contain raw stderr, got: {:?}",
+            result.filtered
+        );
+        assert!(
+            !result.filtered.contains("SYNTHETIC PLACEHOLDER"),
+            "low-info placeholder must be replaced: {:?}",
+            result.filtered
+        );
     }
 
     #[cfg(not(windows))]
@@ -903,6 +1031,47 @@ pub(crate) mod tests {
         let mut f = BlockStreamFilter::new(TestHandler);
         let result = run_block_filter(&mut f, "nothing here\njust text\n", 0);
         assert_eq!(result, "DONE\n");
+    }
+
+    /// Regression test: `BlockStreamFilter::low_info` must forward to the
+    /// underlying handler so the never-worse guard in `run_streaming`
+    /// (which only sees the `StreamFilter` trait) can ask the handler
+    /// whether its summary is uninformative. Without this forwarding the
+    /// streamed `on_exit` placeholder hides real child output.
+    struct LowInfoHandler;
+    impl BlockHandler for LowInfoHandler {
+        fn should_skip(&mut self, _line: &str) -> bool {
+            false
+        }
+        fn is_block_start(&mut self, _line: &str) -> bool {
+            false
+        }
+        fn is_block_continuation(&mut self, _line: &str, _b: &[String]) -> bool {
+            false
+        }
+        fn format_summary(&self, _exit_code: i32, _raw: &str) -> Option<String> {
+            Some("SYNTHETIC PLACEHOLDER".to_string())
+        }
+        fn low_info(&self, raw: &str) -> bool {
+            !raw.trim().is_empty()
+        }
+    }
+
+    #[test]
+    fn test_block_filter_forwards_low_info_to_handler() {
+        let f = BlockStreamFilter::new(LowInfoHandler);
+        // The stream layer only sees StreamFilter; this call must
+        // delegate to the handler so the runner can apply its guard.
+        assert!(f.low_info("TAP version 13\nok 1 - real\n"));
+        assert!(!f.low_info(""));
+    }
+
+    #[test]
+    fn test_block_filter_default_low_info_is_false() {
+        // The default `low_info` impl on BlockHandler returns false, so
+        // handlers that don't opt in keep the old behaviour.
+        let f = BlockStreamFilter::new(TestHandler);
+        assert!(!f.low_info("anything at all"));
     }
 
     #[test]

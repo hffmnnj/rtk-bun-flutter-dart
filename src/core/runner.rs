@@ -188,6 +188,11 @@ pub fn run(
                 stream::run_streaming(&mut cmd, StdinMode::Null, FilterMode::Streaming(filter))
                     .with_context(|| format!("Failed to run {}", tool_name))?;
 
+            // Never-worse guard for the streamed path lives inside
+            // `stream::run_streaming` (it has access to the filter and raw
+            // bytes together). See the `if let Some(mut f) = saved_filter`
+            // block there.
+
             if let Some(label) = opts.tee_label {
                 if let Some(hint) =
                     crate::core::tee::tee_and_hint(&result.raw, label, result.exit_code)
