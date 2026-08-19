@@ -200,8 +200,19 @@ enum Sev {
 }
 
 fn filter_flutter_test(output: &str) -> String {
-    let mut passed = 0;
-    let mut failed = 0;
+    lazy_static! {
+        // Flutter's expanded reporter emits cumulative counters such as
+        // `00:00 +5 -1: ...`. The counters are authoritative; individual
+        // progress lines must not be added together.
+        static ref PROGRESS_RE: Regex =
+            Regex::new(r"^\d{2}:\d{2}\s+\+(\d+)(?:\s+-(\d+))?:").unwrap();
+    }
+
+    let mut progress_passed: Option<usize> = None;
+    let mut progress_failed: Option<usize> = None;
+    let mut explicit_failures = 0;
+    let mut saw_all_passed = false;
+    let mut saw_failure_summary = false;
     let mut failures: Vec<String> = Vec::new();
     let mut in_exception = false;
     let mut current_failure = Vec::new();
@@ -213,29 +224,37 @@ fn filter_flutter_test(output: &str) -> String {
             continue;
         }
 
-        // Progress line: 00:00 +N -M: /path/to/test.dart: description
-        if trimmed.starts_with("00:00 +") {
-            // Count passing/failing markers in the progress token
-            if let Some(rest) = trimmed.strip_prefix("00:00 +") {
-                let marker_end = rest.find(':').unwrap_or(rest.len());
-                let marker = &rest[..marker_end];
-                if marker.contains("-") {
-                    // A failure is active at this point; we'll record it on [E] or explicit fail.
-                }
-            }
+        // Progress lines contain cumulative counters. Parse the final line as
+        // well, because `All tests passed!` is itself a progress line.
+        if let Some(caps) = PROGRESS_RE.captures(trimmed) {
+            let passed = caps[1].parse::<usize>().unwrap_or(0);
+            let failed = caps
+                .get(2)
+                .and_then(|value| value.as_str().parse::<usize>().ok())
+                .unwrap_or(0);
+            progress_passed = Some(progress_passed.unwrap_or(0).max(passed));
+            progress_failed = Some(progress_failed.unwrap_or(0).max(failed));
+            saw_all_passed |= trimmed.contains("All tests passed!");
+            saw_failure_summary |= trimmed.contains("Some tests failed")
+                || trimmed.contains("Test failed.");
             continue;
         }
 
-        if trimmed.contains("[E]") || trimmed.starts_with("══╡ EXCEPTION") || trimmed.contains("Test failed.") {
+        if trimmed.contains("[E]")
+            || trimmed.starts_with("══╡ EXCEPTION")
+            || trimmed.contains("Test failed.")
+        {
             if !current_failure.is_empty() {
                 failures.push(current_failure.join("\n"));
                 current_failure.clear();
             }
             in_exception = true;
             current_failure.push(trimmed.to_string());
-            failed += 1;
+            explicit_failures += 1;
             continue;
         }
+
+        saw_failure_summary |= trimmed.contains("Some tests failed");
 
         if in_exception {
             if trimmed.starts_with("═════════════════") {
@@ -262,7 +281,7 @@ fn filter_flutter_test(output: &str) -> String {
         }
 
         if trimmed.contains("All tests passed!") {
-            passed += 1;
+            saw_all_passed = true;
         }
     }
 
@@ -270,7 +289,11 @@ fn filter_flutter_test(output: &str) -> String {
         failures.push(current_failure.join("\n"));
     }
 
-    let summary = format!("{} passed, {} failed", passed.max(0), failed);
+    let passed = progress_passed.unwrap_or(usize::from(saw_all_passed));
+    let failed = progress_failed.unwrap_or_else(|| {
+        usize::from(saw_failure_summary).max(explicit_failures)
+    });
+    let summary = format!("{} passed, {} failed", passed, failed);
     let mut lines = vec![summary];
     for failure in failures {
         lines.push("---".to_string());
@@ -344,6 +367,32 @@ warning • Local variable unused • lib/main.dart:35:9 • unused_local_variab
         let res = filter_flutter_analyze(out);
         assert!(res.contains("20 issues found"));
         assert!(res.contains("unused_local_variable"));
+    }
+
+    #[test]
+    fn test_filter_flutter_test_counts_expanded_progress() {
+        let out = r#"
+00:00 +0: loading test/services/example_test.dart
+00:00 +0: example group first test
+00:00 +1: example group second test
+00:00 +2: example group third test
+00:00 +3: example group fourth test
+00:00 +4: example group fifth test
+00:00 +5: All tests passed!
+"#;
+        let res = filter_flutter_test(out);
+        assert!(res.contains("5 passed, 0 failed"), "result was: {res}");
+    }
+
+    #[test]
+    fn test_filter_flutter_test_counts_failed_progress() {
+        let out = r#"
+00:00 +0: loading test/services/example_test.dart
+00:00 +1 -1: example group failing test [E]
+00:00 +1 -1: Some tests failed.
+"#;
+        let res = filter_flutter_test(out);
+        assert!(res.contains("1 passed, 1 failed"), "result was: {res}");
     }
 
     #[test]
