@@ -29,7 +29,8 @@ tool output. Original commands are never rewritten.
 - Direct `rtk` stays supported (`bun`/`dart`/`flutter` retained fork).
 - Raw retry only after a failed default attempt and only when safe:
   `rtk proxy <command> [args...]`, or whole expression
-  `rtk proxy bash -c '...'`. No automatic rerun.
+  `rtk proxy bash -c '...'`. In RTK 1.0.1, `proxy` is a compatible alias of
+  `bypass`; neither filters output. No automatic rerun.
 
 ## Why output-only
 
