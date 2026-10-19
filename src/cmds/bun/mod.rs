@@ -1,1 +1,1 @@
-automod::dir!(pub "src/cmds/bun");
+pub mod bun_cmd;

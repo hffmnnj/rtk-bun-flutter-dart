@@ -6,15 +6,16 @@
 //! and redundant build status updates.
 
 use crate::core::runner;
+use crate::core::shell::display_args;
 use crate::core::stream::{BlockHandler, BlockStreamFilter};
 use crate::core::utils::{resolved_command, strip_ansi};
 use anyhow::Result;
-use lazy_static::lazy_static;
-use regex::Regex;
-use std::ffi::OsString;
 
 /// Run `bun test` and show only failures plus a compact summary.
 pub fn run_bun_test(args: &[String], verbose: u8) -> Result<i32> {
+    if runner::is_watch_mode(args) {
+        return crate::cmds::js::bun_cmd::run_test(args, verbose);
+    }
     let mut cmd = resolved_command("bun");
     cmd.arg("test");
     for arg in args {
@@ -28,7 +29,7 @@ pub fn run_bun_test(args: &[String], verbose: u8) -> Result<i32> {
     runner::run_streamed(
         cmd,
         "bun test",
-        &args.join(" "),
+        &display_args(args),
         Box::new(BlockStreamFilter::new(BunTestHandler::new())),
         runner::RunOptions::with_tee("bun test"),
     )
@@ -41,31 +42,17 @@ pub fn run_bun_run(args: &[String], verbose: u8) -> Result<i32> {
 
 /// Run `bun install` and strip progress / download noise.
 pub fn run_bun_install(args: &[String], verbose: u8) -> Result<i32> {
-    run_filtered(
-        "bun",
-        &["install"],
-        args,
-        "bun install",
-        filter_bun_install,
-        verbose,
-    )
+    crate::cmds::js::bun_cmd::run_pkg("install", args, verbose)
 }
 
 /// Run `bun add` and strip progress / download noise.
 pub fn run_bun_add(args: &[String], verbose: u8) -> Result<i32> {
-    run_filtered("bun", &["add"], args, "bun add", filter_bun_install, verbose)
+    crate::cmds::js::bun_cmd::run_pkg("add", args, verbose)
 }
 
 /// Run `bun remove` and strip progress noise.
 pub fn run_bun_remove(args: &[String], verbose: u8) -> Result<i32> {
-    run_filtered(
-        "bun",
-        &["remove"],
-        args,
-        "bun remove",
-        filter_bun_install,
-        verbose,
-    )
+    crate::cmds::js::bun_cmd::run_pkg("remove", args, verbose)
 }
 
 /// Run `bun update` and strip progress / lockfile churn.
@@ -85,25 +72,11 @@ pub fn run_bun_pm(args: &[String], verbose: u8) -> Result<i32> {
     run_filtered("bun", &["pm"], args, "bun pm", filter_bun_pm, verbose)
 }
 
-/// Run `bun build` and strip per-file status spam.
+/// Run `bun build` without changing bundled code or diagnostics.
 pub fn run_bun_build(args: &[String], verbose: u8) -> Result<i32> {
-    let mut cmd = resolved_command("bun");
-    cmd.arg("build");
-    for arg in args {
-        cmd.arg(arg);
-    }
-
-    if verbose > 0 {
-        eprintln!("Running: bun build {}", args.join(" "));
-    }
-
-    runner::run_filtered(
-        cmd,
-        "bun build",
-        &args.join(" "),
-        filter_bun_build,
-        runner::RunOptions::default(),
-    )
+    // A build without --outfile/--outdir writes the bundle itself to stdout.
+    // Upstream's passthrough preserves that artifact instead of filtering it.
+    crate::cmds::js::bun_cmd::run_build(args, verbose)
 }
 
 /// Run `bun create` and keep only the essential scaffold output.
@@ -121,7 +94,7 @@ pub fn run_bun_create(args: &[String], verbose: u8) -> Result<i32> {
     runner::run_filtered(
         cmd,
         "bun create",
-        &args.join(" "),
+        &display_args(args),
         filter_bun_create,
         runner::RunOptions::default(),
     )
@@ -142,28 +115,21 @@ pub fn run_bun_init(args: &[String], verbose: u8) -> Result<i32> {
     runner::run_filtered(
         cmd,
         "bun init",
-        &args.join(" "),
+        &display_args(args),
         filter_bun_create,
         runner::RunOptions::default(),
     )
 }
 
 /// Run `bunx`. Route known tools to their specialized rtk filters; otherwise passthrough.
-pub fn run_bunx(args: &[String], verbose: u8) -> Result<i32> {
+pub fn run_bunx(args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
     if let Some(first) = args.first().map(|s| s.as_str()) {
         match first {
-            "tsc" => return crate::cmds::js::tsc_cmd::run(&args[1..], verbose),
-            "eslint" => return crate::cmds::js::lint_cmd::run(&args[1..], verbose),
+            "tsc" => return crate::cmds::js::tsc_cmd::run(Some("bunx"), &args[1..], verbose),
+            "eslint" => return crate::cmds::js::lint_cmd::run(Some("bunx"), args, verbose),
             "prettier" => return crate::cmds::js::prettier_cmd::run(&args[1..], verbose),
-            "vitest" | "jest" => {
-                let command = crate::Commands::Vitest {
-                    args: args[1..].to_vec(),
-                };
-                return crate::cmds::js::vitest_cmd::run_test(&command,
-                    &args[1..],
-                    verbose,
-                );
-            }
+            "vitest" => return crate::cmds::js::vitest_cmd::run_vitest(&args[1..], verbose),
+            "jest" => return crate::cmds::js::vitest_cmd::run_jest(&args[1..], verbose),
             "prisma" => {
                 // Prisma subcommands require a typed enum; passthrough is safest.
             }
@@ -171,16 +137,7 @@ pub fn run_bunx(args: &[String], verbose: u8) -> Result<i32> {
         }
     }
 
-    let mut os_args: Vec<OsString> = Vec::with_capacity(args.len());
-    for arg in args {
-        os_args.push(arg.as_str().into());
-    }
-
-    if verbose > 0 {
-        eprintln!("Running: bunx {}", args.join(" "));
-    }
-
-    runner::run_passthrough("bunx", &os_args, verbose)
+    crate::cmds::js::bun_cmd::run_bunx(args, verbose, skip_env)
 }
 
 fn run_filtered(
@@ -200,13 +157,18 @@ fn run_filtered(
     }
 
     if verbose > 0 {
-        eprintln!("Running: {} {} {}", base, base_args.join(" "), args.join(" "));
+        eprintln!(
+            "Running: {} {} {}",
+            base,
+            base_args.join(" "),
+            args.join(" ")
+        );
     }
 
     runner::run_filtered(
         cmd,
         label,
-        &args.join(" "),
+        &display_args(args),
         filter,
         runner::RunOptions::default(),
     )
@@ -289,8 +251,7 @@ impl BlockHandler for BunTestHandler {
         }
     }
 
-    fn is_block_continuation(
-        &mut self, line: &str, _block: &[String]) -> bool {
+    fn is_block_continuation(&mut self, line: &str, _block: &[String]) -> bool {
         let clean = strip_ansi(line);
         clean.starts_with("  ") || clean.starts_with('\t') || clean.starts_with("at ")
     }
@@ -303,8 +264,7 @@ impl BlockHandler for BunTestHandler {
         // what bun actually said — return None so the runner can fall back
         // to the raw output instead of emitting a misleading "no output".
         let raw_trimmed = raw.trim();
-        let counters_zero =
-            self.failed == 0 && self.passed == 0 && self.skipped == 0;
+        let counters_zero = self.failed == 0 && self.passed == 0 && self.skipped == 0;
         if counters_zero && !raw_trimmed.is_empty() {
             return None;
         }
@@ -334,8 +294,7 @@ impl BlockHandler for BunTestHandler {
     fn low_info(&self, raw: &str) -> bool {
         // No markers matched AND raw output is non-empty → filter could not
         // classify anything; the raw output is the truth.
-        let counters_zero =
-            self.failed == 0 && self.passed == 0 && self.skipped == 0;
+        let counters_zero = self.failed == 0 && self.passed == 0 && self.skipped == 0;
         counters_zero && !raw.trim().is_empty()
     }
 }
@@ -380,36 +339,6 @@ fn filter_bun_pm(output: &str) -> String {
         {
             result.push(clean);
         }
-    }
-    if result.is_empty() {
-        "ok".to_string()
-    } else {
-        result.join("\n")
-    }
-}
-
-fn filter_bun_build(output: &str) -> String {
-    lazy_static! {
-        static ref BUNDLE_RE: Regex = Regex::new(
-            r"^(.*)\s+(\d+(?:\.\d+)?\s*(?:B|KB|MB|GB))\s*$"
-        ).unwrap();
-    }
-    let mut result = Vec::new();
-    let mut errors = Vec::new();
-    for line in output.lines() {
-        let clean = strip_ansi(line);
-        if clean.trim().is_empty() {
-            continue;
-        }
-        if clean.to_lowercase().contains("error") {
-            errors.push(clean.clone());
-        } else if clean.contains("built") || clean.contains("done") || clean.contains("Build") || BUNDLE_RE.is_match(&clean) {
-            result.push(clean);
-        }
-    }
-    if !errors.is_empty() {
-        result.push("---".to_string());
-        result.extend(errors);
     }
     if result.is_empty() {
         "ok".to_string()
@@ -518,13 +447,6 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_bun_build_keeps_errors() {
-        let out = "Bundling...\nerror: Could not resolve \"missing\"\nBuild failed";
-        let res = filter_bun_build(out);
-        assert!(res.contains("error"));
-    }
-
-    #[test]
     fn test_filter_bun_run_keeps_errors() {
         let out = "Starting dev server...\nWARN: something\nError: failed";
         let res = filter_bun_run(out);
@@ -617,7 +539,10 @@ ok 3 - group a > concatenates
   </testsuite>
 </testsuites>";
         let (summary, low_info) = drive_bun_test_handler(input, 0);
-        assert_eq!(summary, None, "JUnit output must yield no synthetic summary");
+        assert_eq!(
+            summary, None,
+            "JUnit output must yield no synthetic summary"
+        );
         assert!(low_info, "JUnit output must be flagged low-info");
     }
 
@@ -632,7 +557,10 @@ note: Tests need \".test\", \"_test_\", \".spec\" or \"_spec_\" in the filename 
 
 Learn more about bun test: https://bun.com/docs/cli/test";
         let (summary, low_info) = drive_bun_test_handler(input, 1);
-        assert_eq!(summary, None, "empty-dir error must yield no synthetic summary");
+        assert_eq!(
+            summary, None,
+            "empty-dir error must yield no synthetic summary"
+        );
         assert!(low_info, "empty-dir error must be flagged low-info");
     }
 
@@ -643,7 +571,10 @@ Learn more about bun test: https://bun.com/docs/cli/test";
         // that tells the user something went wrong.
         let (summary, low_info) = drive_bun_test_handler("", 127);
         assert_eq!(summary.as_deref(), Some("bun test: no output (exit 127)"));
-        assert!(!low_info, "empty output + nonzero exit is itself informative");
+        assert!(
+            !low_info,
+            "empty output + nonzero exit is itself informative"
+        );
     }
 
     #[test]

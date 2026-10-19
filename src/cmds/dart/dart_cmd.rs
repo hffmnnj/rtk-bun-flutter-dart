@@ -4,6 +4,7 @@
 //! formats with their `flutter` counterparts.
 
 use crate::core::runner;
+use crate::core::shell::display_args;
 use crate::core::utils::{resolved_command, strip_ansi};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -24,7 +25,14 @@ pub fn run_dart_analyze(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 pub fn run_dart_test(args: &[String], verbose: u8) -> Result<i32> {
-    run_filtered("dart", &["test"], args, "dart test", filter_dart_test, verbose)
+    run_filtered(
+        "dart",
+        &["test"],
+        args,
+        "dart test",
+        filter_dart_test,
+        verbose,
+    )
 }
 
 pub fn run_dart_run(args: &[String], verbose: u8) -> Result<i32> {
@@ -48,13 +56,18 @@ fn run_filtered(
     }
 
     if verbose > 0 {
-        eprintln!("Running: {} {} {}", base, base_args.join(" "), args.join(" "));
+        eprintln!(
+            "Running: {} {} {}",
+            base,
+            base_args.join(" "),
+            args.join(" ")
+        );
     }
 
     runner::run_filtered(
         cmd,
         label,
-        &args.join(" "),
+        &display_args(args),
         filter,
         runner::RunOptions::default(),
     )
@@ -117,15 +130,32 @@ fn filter_dart_analyze(output: &str) -> String {
             } else {
                 Sev::Info
             };
-            let message = before.split_once(' ').map(|x| x.1).unwrap_or(before).trim().to_string();
-            let file = after.split(" - ").next().unwrap_or(after).trim().to_string();
+            let message = before
+                .split_once(' ')
+                .map(|x| x.1)
+                .unwrap_or(before)
+                .trim()
+                .to_string();
+            let file = after
+                .split(" - ")
+                .next()
+                .unwrap_or(after)
+                .trim()
+                .to_string();
             let rule = after.rsplit(" - ").next().unwrap_or("").trim().to_string();
-            by_file.entry(file).or_default().push((sev, format!("{}: {}", rule, message)));
+            by_file
+                .entry(file)
+                .or_default()
+                .push((sev, format!("{}: {}", rule, message)));
         }
     }
 
     if by_file.is_empty() {
-        return if summary.is_empty() { "ok".to_string() } else { summary };
+        return if summary.is_empty() {
+            "ok".to_string()
+        } else {
+            summary
+        };
     }
 
     let mut lines = Vec::new();

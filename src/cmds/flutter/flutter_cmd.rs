@@ -4,14 +4,22 @@
 //! requirements in rtk-ai/rtk#1098.
 
 use crate::core::runner;
+use crate::core::shell::display_args;
 use crate::core::utils::{resolved_command, strip_ansi};
 use anyhow::Result;
-use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 pub fn run_flutter_pub(args: &[String], verbose: u8) -> Result<i32> {
-    run_filtered("flutter", &["pub"], args, "flutter pub", filter_flutter_pub, verbose)
+    run_filtered(
+        "flutter",
+        &["pub"],
+        args,
+        "flutter pub",
+        filter_flutter_pub,
+        verbose,
+    )
 }
 
 pub fn run_flutter_analyze(args: &[String], verbose: u8) -> Result<i32> {
@@ -64,13 +72,18 @@ fn run_filtered(
     }
 
     if verbose > 0 {
-        eprintln!("Running: {} {} {}", base, base_args.join(" "), args.join(" "));
+        eprintln!(
+            "Running: {} {} {}",
+            base,
+            base_args.join(" "),
+            args.join(" ")
+        );
     }
 
     runner::run_filtered(
         cmd,
         label,
-        &args.join(" "),
+        &display_args(args),
         filter,
         runner::RunOptions::default(),
     )
@@ -108,11 +121,10 @@ fn filter_flutter_pub(output: &str) -> String {
 }
 
 fn filter_flutter_analyze(output: &str) -> String {
-    lazy_static! {
-        static ref ISSUE_RE: Regex = Regex::new(
-            r"^(info|warning|error)\s+•\s+(.+?)\s+•\s+(.+?):(\d+):(\d+)\s+•\s+(.+)$"
-        ).unwrap();
-    }
+    static ISSUE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(info|warning|error)\s+•\s+(.+?)\s+•\s+(.+?):(\d+):(\d+)\s+•\s+(.+)$")
+            .unwrap()
+    });
 
     let mut by_file: HashMap<String, Vec<(Sev, String, String)>> = HashMap::new();
     let mut summary = String::new();
@@ -167,7 +179,9 @@ fn filter_flutter_analyze(output: &str) -> String {
         // Deduplicate by (severity, rule, message)
         let mut seen: HashMap<(Sev, String, String), usize> = HashMap::new();
         for (sev, rule, message) in &issues {
-            *seen.entry((*sev, rule.clone(), message.clone())).or_insert(0) += 1;
+            *seen
+                .entry((*sev, rule.clone(), message.clone()))
+                .or_insert(0) += 1;
         }
         let mut deduped: Vec<_> = seen.into_iter().collect();
         deduped.sort_by_key(|((sev, _, _), _)| match sev {
@@ -182,7 +196,10 @@ fn filter_flutter_analyze(output: &str) -> String {
                 Sev::Info => "info",
             };
             if count > 1 {
-                lines.push(format!("  {} {}: {} (x{})", sev_label, rule, message, count));
+                lines.push(format!(
+                    "  {} {}: {} (x{})",
+                    sev_label, rule, message, count
+                ));
             } else {
                 lines.push(format!("  {} {}: {}", sev_label, rule, message));
             }
@@ -200,13 +217,11 @@ enum Sev {
 }
 
 fn filter_flutter_test(output: &str) -> String {
-    lazy_static! {
-        // Flutter's expanded reporter emits cumulative counters such as
-        // `00:00 +5 -1: ...`. The counters are authoritative; individual
-        // progress lines must not be added together.
-        static ref PROGRESS_RE: Regex =
-            Regex::new(r"^\d{2}:\d{2}\s+\+(\d+)(?:\s+-(\d+))?:").unwrap();
-    }
+    // Flutter's expanded reporter emits cumulative counters such as
+    // `00:00 +5 -1: ...`. The counters are authoritative; individual
+    // progress lines must not be added together.
+    static PROGRESS_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\d{2}:\d{2}\s+\+(\d+)(?:\s+-(\d+))?:").unwrap());
 
     let mut progress_passed: Option<usize> = None;
     let mut progress_failed: Option<usize> = None;
@@ -235,8 +250,8 @@ fn filter_flutter_test(output: &str) -> String {
             progress_passed = Some(progress_passed.unwrap_or(0).max(passed));
             progress_failed = Some(progress_failed.unwrap_or(0).max(failed));
             saw_all_passed |= trimmed.contains("All tests passed!");
-            saw_failure_summary |= trimmed.contains("Some tests failed")
-                || trimmed.contains("Test failed.");
+            saw_failure_summary |=
+                trimmed.contains("Some tests failed") || trimmed.contains("Test failed.");
             continue;
         }
 
@@ -290,9 +305,8 @@ fn filter_flutter_test(output: &str) -> String {
     }
 
     let passed = progress_passed.unwrap_or(usize::from(saw_all_passed));
-    let failed = progress_failed.unwrap_or_else(|| {
-        usize::from(saw_failure_summary).max(explicit_failures)
-    });
+    let failed =
+        progress_failed.unwrap_or_else(|| usize::from(saw_failure_summary).max(explicit_failures));
     let summary = format!("{} passed, {} failed", passed, failed);
     let mut lines = vec![summary];
     for failure in failures {
@@ -303,11 +317,6 @@ fn filter_flutter_test(output: &str) -> String {
 }
 
 fn filter_flutter_build(output: &str) -> String {
-    lazy_static! {
-        static ref BUILD_LINE_RE: Regex = Regex::new(
-            r"^(\S+)\s+(.+)$"
-        ).unwrap();
-    }
     let mut result = Vec::new();
     let mut errors = Vec::new();
 
