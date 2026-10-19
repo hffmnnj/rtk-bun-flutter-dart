@@ -32,7 +32,7 @@ type Filter = { args: string[] };
 /**
  * Selects an explicit `rtk pipe -f <filter>` from simple known command
  * prefixes. Matching is deliberately narrow — leading whitespace, then an
- * exact command word (or `git`/`cargo` + exact subcommand) at a word
+ * exact command word (or `git`/`cargo`/`bun` + exact subcommand) at a word
  * boundary — so a mismatched filter can never mangle output it was not built
  * for. `git show` is excluded on purpose (blob output is unsafe to prune);
  * absolute-path invocations (`/usr/bin/git status`), env-prefixed commands,
@@ -45,6 +45,8 @@ function selectFilter(command: string): Filter {
   if (m) return { args: ["-f", `git-${m[2]}`] };
   m = /^(cargo)\s+test(?:\s|$)/.exec(text);
   if (m) return { args: ["-f", "cargo-test"] };
+  m = /^(bun)\s+test(?:\s|$)/.exec(text);
+  if (m) return { args: ["-f", "bun-test"] };
   m = /^(pytest|tsc|vitest|find|fd|rg|grep)(?:\s|$)/.exec(text);
   if (m) {
     const name = m[1] === "fd" ? "find" : m[1] === "rg" ? "grep" : m[1];

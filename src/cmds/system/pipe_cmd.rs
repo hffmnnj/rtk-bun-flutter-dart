@@ -16,6 +16,7 @@ pub fn resolve_filter(name: &str) -> Option<fn(&str) -> String> {
         "go-test" => Some(go_test_wrapper),
         "go-build" => Some(crate::cmds::go::go_cmd::filter_go_build),
         "ctest" => Some(crate::cmds::system::ctest_cmd::filter_ctest_output),
+        "bun-test" => Some(crate::cmds::bun::bun_cmd::filter_bun_test_output),
         "tsc" => Some(crate::cmds::js::tsc_cmd::filter_tsc_output),
         "vitest" => Some(vitest_wrapper),
         "grep" | "rg" => Some(grep_wrapper),
@@ -273,7 +274,7 @@ pub fn run(filter_name: Option<&str>, passthrough: bool) -> Result<()> {
         Some(name) => resolve_filter(name).ok_or_else(|| {
             anyhow::anyhow!(
                 "Unknown filter '{}'. Available: cargo-test, pytest, go-test, go-build, \
-                 ctest, tsc, vitest, grep, rg, find, fd, git-log, git-diff, git-status, \
+                 ctest, bun-test, tsc, vitest, grep, rg, find, fd, git-log, git-diff, git-status, \
                  log, mypy, ruff-check, ruff-format, sqlfluff-lint, prettier, phpunit, pest, \
                  paratest, php-test, ecs, phpstan, pint",
                 name
@@ -373,6 +374,31 @@ mod tests {
     #[test]
     fn test_resolve_filter_ctest() {
         assert!(resolve_filter("ctest").is_some());
+    }
+
+    #[test]
+    fn test_resolve_filter_bun_test() {
+        // Explicit opt-in only: `rtk pipe -f bun-test` routes here, while
+        // generic autodetect keeps passing bun output through untouched.
+        let f = resolve_filter("bun-test").expect("bun-test filter must exist");
+        let input = "bun test v1.4.0\n\n(pass) math suite > adds two positive integers correctly [0.42ms]\n(pass) math suite > subtracts negative numbers and borrows [0.31ms]\n\n2 pass\n0 fail\nRan 2 tests across 1 file. [10ms]\n";
+        let out = f(input);
+        assert!(
+            out.contains("... (2 passing bun-test lines elided; totals retained below)"),
+            "out={}",
+            out
+        );
+        assert!(
+            out.contains("2 pass") && out.contains("Ran 2 tests across 1 file."),
+            "out={}",
+            out
+        );
+        assert!(out.len() < input.len(), "filtered must be smaller");
+        // Unknown shapes (e.g. TAP reporter) pass through byte-identical.
+        let tap = "TAP version 13\nok 1 - adds\n1..1\n";
+        assert_eq!(f(tap), tap);
+        // Explicit opt-in only: generic autodetect must not claim bun output.
+        assert_eq!(auto_detect_filter(input)(input), input);
     }
 
     #[test]

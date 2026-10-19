@@ -299,6 +299,208 @@ impl BlockHandler for BunTestHandler {
     }
 }
 
+/// Pure pipe filter for `bun test` default-reporter output where every test passed.
+///
+/// This is separate from `BunTestHandler` (the streaming runner filter) on
+/// purpose: the handler drops passing lines as uninformative context while it
+/// reconstructs failures, but a pipe filter must preserve every other
+/// original byte and only elide literal `(pass) ` reporter lines. Runner
+/// behavior is untouched — this function is only reachable via
+/// `rtk pipe -f bun-test`.
+///
+/// Each maximal run of adjacent `(pass) ` lines (matched after ANSI
+/// stripping) is replaced with one
+/// `... ({k} passing bun-test lines elided; totals retained below)` marker.
+/// Anything that is not exactly a green default-reporter run — unknown
+/// reporters, failures, malformed or multi-report blobs, control characters,
+/// or output where elision would not shrink the bytes — is returned unchanged.
+pub(crate) fn filter_bun_test_output(output: &str) -> String {
+    try_elide_bun_pass_lines(output).unwrap_or_else(|| output.to_string())
+}
+
+/// Measured admission guards for [`filter_bun_test_output`]; `None` means
+/// "decline and pass the input through unchanged".
+fn try_elide_bun_pass_lines(output: &str) -> Option<String> {
+    // Line-oriented elision is only sound for LF-separated text.
+    if output.contains('\r') || output.contains('\u{2028}') || output.contains('\u{2029}') {
+        return None;
+    }
+    // Split on '\n' rather than `str::lines` so a trailing LF round-trips
+    // byte-identically through the join below.
+    let raw: Vec<&str> = output.split('\n').collect();
+    let stripped: Vec<String> = raw.iter().map(|line| strip_ansi(line)).collect();
+    let nonempty: Vec<&str> = stripped
+        .iter()
+        .map(String::as_str)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    // First nonempty line is the `bun test v...` banner, occurring exactly once.
+    if !nonempty
+        .first()
+        .is_some_and(|line| line.starts_with("bun test v"))
+    {
+        return None;
+    }
+    if stripped
+        .iter()
+        .filter(|line| line.starts_with("bun test v"))
+        .count()
+        != 1
+    {
+        return None;
+    }
+    // Exactly one anchored `N pass` summary ...
+    let pass_totals: Vec<usize> = stripped
+        .iter()
+        .filter_map(|line| parse_bun_count(line, "pass"))
+        .collect();
+    if pass_totals.len() != 1 {
+        return None;
+    }
+    let expected = pass_totals[0];
+    // ... and one anchored `0 fail` summary, with no nonzero fail count ...
+    if stripped
+        .iter()
+        .filter(|line| is_bun_zero_fail(line))
+        .count()
+        != 1
+    {
+        return None;
+    }
+    if stripped.iter().any(|line| is_bun_nonzero_fail(line)) {
+        return None;
+    }
+    // ... and no failure marker lines.
+    if stripped.iter().any(|line| line.starts_with("(fail) ")) {
+        return None;
+    }
+    // The last nonempty line is the exact `Ran N tests across M files. [duration]`
+    // footer, with exactly one such footer overall, a matching N, and M >= 1.
+    if stripped
+        .iter()
+        .filter_map(|line| parse_bun_footer(line))
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let (foot_tests, foot_files) = parse_bun_footer(nonempty.last().copied()?)?;
+    if foot_tests != expected || foot_files < 1 {
+        return None;
+    }
+    // The `(pass) ` marker count agrees with the totals.
+    let pass_idx: Vec<usize> = stripped
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("(pass) "))
+        .map(|(idx, _)| idx)
+        .collect();
+    if pass_idx.len() != expected {
+        return None;
+    }
+
+    // Replace each maximal run of adjacent pass lines with one marker,
+    // keeping every other original line byte-identical (including ANSI).
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    let mut cursor = 0usize;
+    let mut next = 0usize;
+    while cursor < raw.len() {
+        if next < pass_idx.len() && pass_idx[next] == cursor {
+            let mut end = cursor;
+            while next < pass_idx.len() && pass_idx[next] == end {
+                next += 1;
+                end += 1;
+            }
+            out.push(format!(
+                "... ({} passing bun-test lines elided; totals retained below)",
+                end - cursor
+            ));
+            cursor = end;
+        } else {
+            out.push(raw[cursor].to_string());
+            cursor += 1;
+        }
+    }
+    let built = out.join("\n");
+    // Never emit bytes that are not strictly smaller than the input.
+    if built.len() >= output.len() {
+        return None;
+    }
+    Some(built)
+}
+
+/// Parse an anchored `<N> <kind>` summary line (e.g. `3 pass`), returning N.
+fn parse_bun_count(line: &str, kind: &str) -> Option<usize> {
+    let mut parts = line.split_whitespace();
+    let count = parts.next()?;
+    if parts.next()? != kind || parts.next().is_some() {
+        return None;
+    }
+    if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    count.parse::<usize>().ok()
+}
+
+/// Anchored `0 fail` summary line.
+fn is_bun_zero_fail(line: &str) -> bool {
+    let mut parts = line.split_whitespace();
+    matches!(parts.next(), Some("0"))
+        && matches!(parts.next(), Some("fail"))
+        && parts.next().is_none()
+}
+
+/// Anchored nonzero `<N> fail` summary line (`N >= 1`).
+fn is_bun_nonzero_fail(line: &str) -> bool {
+    let mut parts = line.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(n), Some("fail"), None) => {
+            !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && n.as_bytes()[0] != b'0'
+        }
+        _ => false,
+    }
+}
+
+/// Parse the exact `Ran N tests across M files. [duration]` footer, returning
+/// (N, M). Accepts the singular/plural `test(s)` / `file(s)` spellings and the
+/// duration units bun emits (`ms`, `s`, `us`, micro-s, `ns`, `m`, or bare
+/// digits); the match is anchored: no leading or trailing characters.
+fn parse_bun_footer(line: &str) -> Option<(usize, usize)> {
+    let rest = line.strip_prefix("Ran ")?;
+    let (tests, rest) = split_leading_digits(rest)?;
+    let rest = rest
+        .strip_prefix(" tests ")
+        .or_else(|| rest.strip_prefix(" test "))?;
+    let rest = rest.strip_prefix("across ")?;
+    let (files, rest) = split_leading_digits(rest)?;
+    let rest = rest
+        .strip_prefix(" files. [")
+        .or_else(|| rest.strip_prefix(" file. ["))?;
+    let duration = rest.strip_suffix(']')?;
+    let num_len = duration
+        .bytes()
+        .take_while(|b| b.is_ascii_digit() || *b == b'.')
+        .count();
+    if num_len == 0 {
+        return None;
+    }
+    match duration[num_len..].trim_start() {
+        "" | "ms" | "s" | "us" | "ns" | "m" | "\u{00b5}s" => {}
+        _ => return None,
+    }
+    Some((tests.parse::<usize>().ok()?, files.parse::<usize>().ok()?))
+}
+
+/// Split leading ASCII digits off `s`, requiring at least one.
+fn split_leading_digits(s: &str) -> Option<(&str, &str)> {
+    let len = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if len == 0 {
+        return None;
+    }
+    Some((&s[..len], &s[len..]))
+}
+
 fn filter_bun_install(output: &str) -> String {
     let mut result = Vec::new();
     for line in output.lines() {
@@ -600,5 +802,216 @@ Learn more about bun test: https://bun.com/docs/cli/test";
         assert!(s.contains("1 failed"), "got: {s}");
         assert!(s.contains("(fail) two"), "failure block included: {s}");
         assert!(!low_info);
+    }
+
+    // ---- filter_bun_test_output: pure `rtk pipe -f bun-test` filter ----
+    //
+    // Unlike BunTestHandler (which drops passing lines as streaming context
+    // noise while reconstructing failures), this filter elides only literal
+    // `(pass) ` reporter lines behind measured guards and preserves every
+    // other original byte. Anything else passes through unchanged.
+
+    const BUN_PIPE_GREEN: &str = "bun test v1.2.3\n\
+\n\
+(pass) adds 1+1 [0.05ms]\n\
+(pass) subtracts [0.02ms]\n\
+(pass) concatenates [0.01ms]\n\
+\n\
+3 pass\n\
+0 fail\n\
+Ran 3 tests across 1 file. [25.00ms]\n";
+
+    #[test]
+    fn bun_pipe_filter_elides_pass_run_and_retains_totals() {
+        let out = filter_bun_test_output(BUN_PIPE_GREEN);
+        let expected = "bun test v1.2.3\n\
+\n\
+... (3 passing bun-test lines elided; totals retained below)\n\
+\n\
+3 pass\n\
+0 fail\n\
+Ran 3 tests across 1 file. [25.00ms]\n";
+        assert_eq!(out, expected);
+        assert!(out.len() < BUN_PIPE_GREEN.len(), "must shrink the bytes");
+    }
+
+    #[test]
+    fn bun_pipe_filter_retains_diagnostics_and_splits_runs_byte_exact() {
+        // Logs, warnings, file headers and skips interleave the pass lines,
+        // so each maximal run gets its own marker with its own count.
+        let input = "bun test v1.4.0 (bun)\n\
+a.test.ts:\n\
+(pass) math suite > adds two positive integers and returns sum [0.12ms]\n\
+(pass) math suite > subtracts negative numbers and borrows [0.03ms]\n\
+console.log: debug noise\n\
+warn: flaky timing\n\
+(pass) math suite > concatenates strings with unicode separators [0.01ms]\n\
+(skip) pending thing\n\
+3 pass\n\
+0 fail\n\
+Ran 3 tests across 1 file. [12.40ms]\n";
+        let out = filter_bun_test_output(input);
+        let expected = "bun test v1.4.0 (bun)\n\
+a.test.ts:\n\
+... (2 passing bun-test lines elided; totals retained below)\n\
+console.log: debug noise\n\
+warn: flaky timing\n\
+... (1 passing bun-test lines elided; totals retained below)\n\
+(skip) pending thing\n\
+3 pass\n\
+0 fail\n\
+Ran 3 tests across 1 file. [12.40ms]\n";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn bun_pipe_filter_elides_ansi_colored_pass_lines_but_preserves_other_bytes() {
+        // Matching is on the ANSI-stripped text, but retained lines keep
+        // their original escape bytes untouched.
+        let input = "bun test v1.4.0\n\
+\n\
+\x1b[32m(pass) math suite > adds two positive integers correctly [0.42ms]\x1b[0m\n\
+\x1b[32m(pass) math suite > subtracts negative numbers and borrows [0.31ms]\x1b[0m\n\
+\x1b[33mwarn: colored warning\x1b[0m\n\
+2 pass\n\
+0 fail\n\
+Ran 2 tests across 1 file. [5ms]\n";
+        let out = filter_bun_test_output(input);
+        let expected = "bun test v1.4.0\n\
+\n\
+... (2 passing bun-test lines elided; totals retained below)\n\
+\x1b[33mwarn: colored warning\x1b[0m\n\
+2 pass\n\
+0 fail\n\
+Ran 2 tests across 1 file. [5ms]\n";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn bun_pipe_filter_preserves_trailing_newline_shape() {
+        let with_lf = filter_bun_test_output(BUN_PIPE_GREEN);
+        assert!(with_lf.ends_with('\n'), "trailing LF must survive");
+        let no_lf = &BUN_PIPE_GREEN[..BUN_PIPE_GREEN.len() - 1];
+        let out = filter_bun_test_output(no_lf);
+        assert!(!out.ends_with('\n'), "no LF invented: {out:?}");
+        assert!(out.contains("... (3 passing bun-test lines elided; totals retained below)"));
+        assert!(out.contains("Ran 3 tests across 1 file. [25.00ms]"));
+    }
+
+    #[test]
+    fn bun_pipe_filter_declines_fail_markers_even_when_summaries_look_green() {
+        // A `(fail) ` line vetoes elision even though the counts are otherwise
+        // consistent — passing lines may carry the failure's context.
+        let input = "bun test v1.4.0\n\
+(pass) one\n\
+(fail) two\n\
+1 pass\n\
+0 fail\n\
+Ran 1 tests across 1 file. [6ms]\n";
+        assert_eq!(filter_bun_test_output(input), input);
+    }
+
+    #[test]
+    fn bun_pipe_filter_declines_nonzero_fail_summary() {
+        let input = "bun test v1.4.0\n\
+(pass) one\n\
+(pass) two\n\
+(pass) three\n\
+3 pass\n\
+1 fail\n\
+Ran 4 tests across 1 file. [5ms]\n";
+        assert_eq!(filter_bun_test_output(input), input);
+    }
+
+    #[test]
+    fn bun_pipe_filter_declines_malformed_output_missing_footer() {
+        let input = "bun test v1.4.0\n(pass) one\n1 pass\n0 fail\n";
+        assert_eq!(filter_bun_test_output(input), input);
+    }
+
+    #[test]
+    fn bun_pipe_filter_declines_multiple_reports() {
+        // Two banners / summaries / footers in one blob must not be folded.
+        let input = "bun test v1.4.0\n\
+(pass) one\n\
+1 pass\n\
+0 fail\n\
+Ran 1 tests across 1 file. [3ms]\n\
+bun test v1.4.0\n\
+(pass) two\n\
+1 pass\n\
+0 fail\n\
+Ran 1 tests across 1 file. [4ms]\n";
+        assert_eq!(filter_bun_test_output(input), input);
+    }
+
+    #[test]
+    fn bun_pipe_filter_declines_count_mismatch() {
+        // Two `(pass) ` lines but the totals claim three.
+        let input = "bun test v1.4.0\n\
+(pass) one\n\
+(pass) two\n\
+3 pass\n\
+0 fail\n\
+Ran 3 tests across 1 file. [3ms]\n";
+        assert_eq!(filter_bun_test_output(input), input);
+    }
+
+    #[test]
+    fn bun_pipe_filter_passes_through_tap_and_junit_reporters() {
+        let tap = "TAP version 13\n\
+ok 1 - adds 1+1\n\
+ok 2 - subtracts\n\
+1..2\n\
+# tests 2\n\
+# pass  2\n\
+# fail  0\n";
+        assert_eq!(filter_bun_test_output(tap), tap);
+        let junit = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<testsuites>\n\
+  <testsuite name=\"repro\" tests=\"2\" failures=\"0\" errors=\"0\" skipped=\"0\">\n\
+    <testcase name=\"adds\" time=\"0.001\"/>\n\
+  </testsuite>\n\
+</testsuites>\n";
+        assert_eq!(filter_bun_test_output(junit), junit);
+    }
+
+    #[test]
+    fn bun_pipe_filter_never_emits_more_bytes_than_raw() {
+        assert!(filter_bun_test_output(BUN_PIPE_GREEN).len() < BUN_PIPE_GREEN.len());
+        // CRLF line endings decline byte-identical.
+        let crlf = BUN_PIPE_GREEN.replace('\n', "\r\n");
+        assert_eq!(filter_bun_test_output(&crlf), crlf);
+        // Unicode line/paragraph separators decline byte-identical too.
+        let u2028 = BUN_PIPE_GREEN.replacen('\n', "\u{2028}", 1);
+        assert_eq!(filter_bun_test_output(&u2028), u2028);
+        let u2029 = BUN_PIPE_GREEN.replacen('\n', "\u{2029}", 1);
+        assert_eq!(filter_bun_test_output(&u2029), u2029);
+    }
+
+    #[test]
+    fn bun_pipe_filter_keeps_pass_lookalike_lines() {
+        // Only lines whose stripped text starts with the literal `(pass) `
+        // (with trailing space) are elided; lookalikes are diagnostics.
+        let input = "bun test v1.4.0\n\
+(passed) not a reporter line\n\
+(pass) authentication > rejects expired tokens with a clear error [0.44ms]\n\
+x (pass) mid-line mention\n\
+(pass)no-space stays\n\
+(pass) authentication > refreshes sessions before the deadline hits [0.38ms]\n\
+2 pass\n\
+0 fail\n\
+Ran 2 tests across 1 file. [7ms]\n";
+        let out = filter_bun_test_output(input);
+        let expected = "bun test v1.4.0\n\
+(passed) not a reporter line\n\
+... (1 passing bun-test lines elided; totals retained below)\n\
+x (pass) mid-line mention\n\
+(pass)no-space stays\n\
+... (1 passing bun-test lines elided; totals retained below)\n\
+2 pass\n\
+0 fail\n\
+Ran 2 tests across 1 file. [7ms]\n";
+        assert_eq!(out, expected);
     }
 }

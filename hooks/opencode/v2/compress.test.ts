@@ -284,3 +284,58 @@ test("compress_pipe_failure_preserves_original_json", async () => {
   const envWithoutRtk: NodeJS.ProcessEnv = { ...process.env, PATH: emptyPathDir }
   expect(await compressOutput(GIT_STATUS, pretty, dir, envWithoutRtk)).toBe(pretty)
 })
+
+test("compress_bun_test_selects_bun_test_filter", async () => {
+  for (const command of ["bun test", "bun test --coverage", "  bun test", "bun test tests/foo.test.ts"]) {
+    clearCalls()
+    const result = await compressOutput(command, LONG_OUTPUT, dir, makeEnv("shrink"))
+    expect(result).toBe(SHRUNK)
+    // Raw output must arrive on stdin byte-identical, never in argv.
+    expect(readFileSync(stdinCapture, "utf8")).toBe(LONG_OUTPUT)
+    const calls = readCalls()
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toBe("3|pipe|-f|bun-test|")
+    expect(calls[0]).not.toContain("line1")
+  }
+})
+
+test("compress_bun_lookalikes_fall_back_to_autodetect", async () => {
+  for (const command of ["bun testx", "bun run test", "bun --cwd /tmp test"]) {
+    clearCalls()
+    const result = await compressOutput(command, LONG_OUTPUT, dir, makeEnv("shrink"))
+    expect(result).toBe(SHRUNK)
+    expect(readFileSync(stdinCapture, "utf8")).toBe(LONG_OUTPUT)
+    // Generic autodetect: bare `pipe` with no `-f`, not `bun-test`.
+    expect(readCalls()).toEqual(["1|pipe|||"])
+  }
+})
+
+test("compress_complex_bun_commands_bypass_subprocess", async () => {
+  for (const command of ["cd /tmp && bun test", "bun test | head -n 5"]) {
+    clearCalls()
+    // Destructive mode proves the bypass: any spawn would surface its output.
+    const result = await compressOutput(command, LONG_OUTPUT, dir, makeEnv("destructive"))
+    expect(result).toBe(LONG_OUTPUT)
+    expect(readCalls()).toEqual([])
+  }
+  // Local JSON still compacts without consulting `rtk pipe`.
+  const pretty = '{\n  "name": "rtk",\n  "count": 3\n}'
+  for (const command of ["cd /tmp && bun test", "bun test | head -n 5"]) {
+    clearCalls()
+    const result = await compressOutput(command, pretty, dir, makeEnv("destructive"))
+    expect(result).toBe('{"name":"rtk","count":3}')
+    expect(readCalls()).toEqual([])
+  }
+})
+
+test("compress_explicit_rtk_bun_test_bypasses_verbatim", async () => {
+  const pretty = '{\n  "a": 1,\n  "b": 2\n}'
+  for (const command of ["rtk proxy bun test", "rtk bypass bun test"]) {
+    clearCalls()
+    // Shrink mode would return SHRUNK if the filter ran, so the pretty
+    // output plus zero calls proves the explicit-`rtk` bypass is honored.
+    const result = await compressOutput(command, pretty, dir, makeEnv("shrink"))
+    expect(result).toBe(pretty)
+    expect(readCalls()).toEqual([])
+  }
+})
