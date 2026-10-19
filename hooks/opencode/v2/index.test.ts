@@ -364,3 +364,180 @@ test("missing_rtk_binary_preserves_original_output", async () => {
     else process.env.PATH = saved
   }
 })
+
+const CODE = "const rows = await queryAll()"
+const PRETTY_JSON = '{\n  "name": "rtk",\n  "count": 3,\n  "tags": ["a", "b"]\n}'
+const COMPACT_JSON = '{"name":"rtk","count":3,"tags":["a","b"]}'
+
+function completedExecuteEvent(code: string, content: unknown, output: unknown, metadata: Record<string, unknown> = { status: "completed", kept: "yes" }) {
+  return {
+    tool: "execute",
+    sessionID: "ses_test1234567890abcdef",
+    agent: "agent_testbuild",
+    messageID: "msg_test1234567890",
+    id: "call_test1234567890",
+    input: { code },
+    status: "completed",
+    result: { output, content, metadata },
+  } as any
+}
+
+test("shell_complex_json_output_compacts_without_subprocess", async () => {
+  const cb = requireCallback()
+  clearCalls()
+  const event = completedShellEvent("git log --oneline | head -5", PRETTY_JSON)
+  await cb(event)
+  expect(event.result.output.output).toBe(COMPACT_JSON)
+  expect(event.result.content).toEqual([{ type: "text", text: COMPACT_JSON }])
+  expect(readCalls()).toEqual([])
+})
+
+test("codemode_array_json_minifies_preserving_rest_without_subprocess", async () => {
+  const cb = requireCallback()
+  clearCalls()
+  const output = { rows: [{ a: 1 }] }
+  const event = completedExecuteEvent(
+    CODE,
+    [
+      { type: "text", text: PRETTY_JSON },
+      { type: "text", text: NOTICE },
+      { type: "file", uri: "file:///tmp/a.png", mime: "image/png" },
+    ],
+    output,
+  )
+  const inputBefore = JSON.parse(JSON.stringify(event.input))
+  await cb(event)
+  expect(event.result.content).toEqual([
+    { type: "text", text: COMPACT_JSON },
+    { type: "text", text: NOTICE },
+    { type: "file", uri: "file:///tmp/a.png", mime: "image/png" },
+  ])
+  expect(event.result.output).toEqual(output)
+  expect(event.result.metadata).toEqual({ status: "completed", kept: "yes" })
+  expect(event.input).toEqual(inputBefore)
+  expect(readCalls()).toEqual([])
+  expect(readStdin()).toBeUndefined()
+})
+
+test("codemode_string_json_syncs_matching_output_string_only", async () => {
+  const cb = requireCallback()
+  clearCalls()
+  const matched = completedExecuteEvent(CODE, PRETTY_JSON, PRETTY_JSON)
+  await cb(matched)
+  expect(matched.result.content).toBe(COMPACT_JSON)
+  expect(matched.result.output).toBe(COMPACT_JSON)
+  expect(matched.input).toEqual({ code: CODE })
+  clearCalls()
+  const structured = completedExecuteEvent(CODE, PRETTY_JSON, { count: 3 })
+  await cb(structured)
+  expect(structured.result.content).toBe(COMPACT_JSON)
+  expect(structured.result.output).toEqual({ count: 3 })
+  expect(readCalls()).toEqual([])
+})
+
+test("codemode_array_output_string_syncs_to_matching_entry", async () => {
+  const cb = requireCallback()
+  clearCalls()
+  const matched = completedExecuteEvent(
+    CODE,
+    [
+      { type: "text", text: PRETTY_JSON },
+      { type: "text", text: NOTICE },
+    ],
+    PRETTY_JSON,
+  )
+  await cb(matched)
+  expect(matched.result.output).toBe(COMPACT_JSON)
+  expect(matched.result.content).toEqual([
+    { type: "text", text: COMPACT_JSON },
+    { type: "text", text: NOTICE },
+  ])
+  clearCalls()
+  const unmatched = completedExecuteEvent(
+    CODE,
+    [
+      { type: "text", text: PRETTY_JSON },
+      { type: "text", text: NOTICE },
+    ],
+    "unrelated log",
+  )
+  await cb(unmatched)
+  expect(unmatched.result.output).toBe("unrelated log")
+  expect(unmatched.result.content).toEqual([
+    { type: "text", text: COMPACT_JSON },
+    { type: "text", text: NOTICE },
+  ])
+  expect(readCalls()).toEqual([])
+})
+
+test("codemode_truncated_metadata_passes_through_unchanged", async () => {
+  const cb = requireCallback()
+  clearCalls()
+  const event = completedExecuteEvent(
+    CODE,
+    [
+      { type: "text", text: PRETTY_JSON },
+      { type: "text", text: NOTICE },
+    ],
+    PRETTY_JSON,
+    { status: "completed", truncated: true },
+  )
+  const before = JSON.parse(JSON.stringify(event))
+  await cb(event)
+  expect(JSON.parse(JSON.stringify(event))).toEqual(before)
+  expect(readCalls()).toEqual([])
+})
+
+test("codemode_raw_code_disabled_and_malformed_pass_through", async () => {
+  const cb = requireCallback()
+  clearCalls()
+  const rawCode = completedExecuteEvent("await shell('rtk status')", PRETTY_JSON, PRETTY_JSON)
+  const rawBefore = JSON.parse(JSON.stringify(rawCode))
+  await cb(rawCode)
+  expect(JSON.parse(JSON.stringify(rawCode))).toEqual(rawBefore)
+  const savedDisabled = process.env.RTK_DISABLED
+  process.env.RTK_DISABLED = "1"
+  try {
+    clearCalls()
+    const disabled = completedExecuteEvent(CODE, PRETTY_JSON, PRETTY_JSON)
+    const disabledBefore = JSON.parse(JSON.stringify(disabled))
+    await cb(disabled)
+    expect(JSON.parse(JSON.stringify(disabled))).toEqual(disabledBefore)
+  } finally {
+    if (savedDisabled === undefined) delete process.env.RTK_DISABLED
+    else process.env.RTK_DISABLED = savedDisabled
+  }
+  for (const bad of ["not json at all", '{"a": 1,', "42", "INFO starting\n{\"a\": 1}"]) {
+    clearCalls()
+    const event = completedExecuteEvent(CODE, bad, bad)
+    const before = JSON.parse(JSON.stringify(event))
+    await cb(event)
+    expect(JSON.parse(JSON.stringify(event))).toEqual(before)
+  }
+  expect(readCalls()).toEqual([])
+})
+
+test("codemode_other_tools_ignore_json_content", async () => {
+  const cb = requireCallback()
+  for (const tool of ["read", "grep", "glob", "skill", "subagent"]) {
+    clearCalls()
+    const event = {
+      tool,
+      sessionID: "ses_test1234567890abcdef",
+      agent: "agent_testbuild",
+      messageID: "msg_test1234567890",
+      id: "call_test1234567890",
+      input: { path: "notes.txt" },
+      status: "completed",
+      result: {
+        output: PRETTY_JSON,
+        content: [{ type: "text", text: PRETTY_JSON }],
+        metadata: {},
+      },
+    } as any
+    const before = JSON.parse(JSON.stringify(event))
+    await cb(event)
+    expect(JSON.parse(JSON.stringify(event))).toEqual(before)
+    expect(readCalls()).toEqual([])
+  }
+})

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { minifyJson } from "./json.ts";
 
 // Budget for the `rtk pipe` subprocess. The compressor only filters text piped
 // on stdin — it never spawns the original command — so a small budget keeps
@@ -7,22 +8,23 @@ import { spawn } from "node:child_process";
 const PIPE_TIMEOUT_MS = 2000;
 const PIPE_MAX_BUFFER = 4 * 1024 * 1024; // 4 MiB
 
-// Conservatively skip any RTK token, including quoted/relative paths and env
-// prefixes. False positives only forgo savings; missing a proxy would lose raw output.
+// Conservative raw intent: explicit `rtk` tokens (quoted/relative/env forms)
+// always pass through verbatim, even when the output is JSON.
 const EXPLICIT_RTK = /(?:^|[\s/'"])rtk(?:[\s'"]|$)/;
 
-// Conservative shell-syntax exclusions: multiline, pipelines, `&&`/`||`/`;` chains, background `&`,
-// redirections, subshells, and command/variable substitution. Filter choice
-// is prefix-based and only sound for simple single commands; anything complex
-// falls back to unfiltered output rather than risk a mismatched filter
-// mangling the text. Deliberately NOT excluded: quotes, env prefixes
-// (`FOO=1 cmd`), globs — those fall through to generic autodetect, which the
-// `rtk pipe` binary passes through unchanged when it cannot safely compress.
+// Complex shell syntax (multiline, pipelines, chains, background,
+// redirections, subshells, substitution) never consults `rtk pipe`; JSON
+// output still compacts locally via minifyJson, everything else passes.
 const COMPLEX_SHELL = /[\n\r|&;><()`$]/;
 
-/** True when the command's output must pass through without consulting `rtk pipe`. */
-function shouldBypass(command: string): boolean {
-  return EXPLICIT_RTK.test(command) || COMPLEX_SHELL.test(command);
+/** True when the command explicitly asks for raw RTK output. */
+function isExplicitRtk(command: string): boolean {
+  return EXPLICIT_RTK.test(command);
+}
+
+/** True when the command is too complex for a prefix-selected filter. */
+function isComplexShell(command: string): boolean {
+  return COMPLEX_SHELL.test(command);
 }
 
 type Filter = { args: string[] };
@@ -65,14 +67,13 @@ function mergeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 /**
- * Compresses captured shell output via `rtk pipe`.
+ * Compresses captured shell output via `rtk pipe` plus local JSON minify.
  *
- * Runs `rtk pipe [-f <filter>]` with the output fed on stdin and returns the
- * filtered text ONLY when the filter exits 0 with non-empty output strictly
- * shorter than the input. Every other outcome — bypass match, `RTK_DISABLED`,
- * spawn error, non-zero exit, timeout, over-size output, empty or
- * longer-or-equal result — returns the original output unchanged. The
- * original command is never spawned; only `rtk pipe` runs.
+ * Disabled/oversize/explicit-`rtk` pass through first. Complex shell returns
+ * the local JSON minify (original when not JSON). Simple commands run
+ * `rtk pipe`; on exit 0 the strictly smaller UTF-8 of the valid pipe result
+ * and the JSON minify wins, otherwise the original stands. Pipe failures
+ * keep the original even when JSON could compact. Only `rtk pipe` runs.
  */
 export async function compressOutput(
   command: string,
@@ -84,7 +85,9 @@ export async function compressOutput(
   if (!output) return output;
   const inputBytes = Buffer.byteLength(output);
   if (inputBytes > PIPE_MAX_BUFFER) return output;
-  if (!command || shouldBypass(command)) return output;
+  if (!command || isExplicitRtk(command)) return output;
+  const jsonCandidate = minifyJson(output);
+  if (isComplexShell(command)) return jsonCandidate;
   const filter = selectFilter(command);
   return new Promise((resolve) => {
     let settled = false;
@@ -120,8 +123,22 @@ export async function compressOutput(
     child.on("close", (code) => {
       if (code !== 0) return done(output);
       const filtered = Buffer.concat(chunks).toString("utf8");
-      if (!filtered.trim() || Buffer.byteLength(filtered) >= inputBytes) return done(output);
-      done(filtered);
+      const filteredBytes = Buffer.byteLength(filtered);
+      const rtkValid = filtered.trim() !== "" && filteredBytes < inputBytes;
+      const jsonBytes = Buffer.byteLength(jsonCandidate);
+      const jsonValid =
+        jsonCandidate !== output && jsonCandidate.trim() !== "" && jsonBytes < inputBytes;
+      let best = output;
+      let bestBytes = inputBytes;
+      if (rtkValid) {
+        best = filtered;
+        bestBytes = filteredBytes;
+      }
+      if (jsonValid && jsonBytes < bestBytes) {
+        best = jsonCandidate;
+        bestBytes = jsonBytes;
+      }
+      done(best);
     });
     // Swallow EPIPE when `rtk pipe` exits early (e.g. unknown filter);
     // `close` still fires and resolves with the original output.

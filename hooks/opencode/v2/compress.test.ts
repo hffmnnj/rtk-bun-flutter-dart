@@ -210,3 +210,77 @@ test("compress_caller_env_overrides_are_used_without_mutating_input", async () =
   expect(process.env.PATH).toBe(pathBefore)
   expect(process.env.RTK_DISABLED).toBe(snapshot.RTK_DISABLED)
 })
+
+test("compress_complex_json_compacts_locally_preserving_lexemes", async () => {
+  clearCalls()
+  const pretty =
+    '{\n  "big": 9007199254740993,\n  "negZero": -0,\n  "exp": 1.2300e+45,\n  "msg": "a  b",\n  "q": "a\\"b",\n  "uni": "\\u0041"\n}'
+  const compact =
+    '{"big":9007199254740993,"negZero":-0,"exp":1.2300e+45,"msg":"a  b","q":"a\\"b","uni":"\\u0041"}'
+  // Destructive mode proves no spawn: any `rtk pipe` call would surface it.
+  const result = await compressOutput(PIPED, pretty, dir, makeEnv("destructive"))
+  expect(result).toBe(compact)
+  expect(JSON.parse(result)).toEqual(JSON.parse(pretty))
+  expect(readCalls()).toEqual([])
+})
+
+test("compress_complex_plain_and_mixed_logs_bypass_without_spawn", async () => {
+  const cases = [
+    "line1\nline2\nline3",
+    "INFO starting\n{\"a\": 1}",
+    '{"a":1} trailing',
+    '{"a":1}\n{"b":2}',
+    '{"a": 1,',
+  ]
+  for (const output of cases) {
+    clearCalls()
+    // Shrink mode would return SHRUNK if a filter ran, so the original plus
+    // zero calls proves complex output never consults `rtk pipe`.
+    const result = await compressOutput("git log --oneline; echo done", output, dir, makeEnv("shrink"))
+    expect(result).toBe(output)
+    expect(readCalls()).toEqual([])
+  }
+})
+
+test("compress_explicit_rtk_json_bypasses_verbatim_without_spawn", async () => {
+  const pretty = '{\n  "a": 1,\n  "b": 2\n}'
+  for (const command of [
+    "rtk proxy git status",
+    "rtk status",
+    "/usr/local/bin/rtk pipe git status",
+    "'rtk' proxy git status",
+    "FOO=1 rtk git log",
+  ]) {
+    clearCalls()
+    const result = await compressOutput(command, pretty, dir, makeEnv("shrink"))
+    expect(result).toBe(pretty)
+    expect(readCalls()).toEqual([])
+  }
+})
+
+test("compress_simple_pipe_success_prefers_smallest_of_pipe_and_json", async () => {
+  const pretty = '{\n  "name": "rtk",\n  "count": 3\n}'
+  const minified = '{"name":"rtk","count":3}'
+  // Pipe returns a valid but longer-than-minified result: local JSON wins.
+  clearCalls()
+  const jsonWins = await compressOutput(
+    GIT_STATUS,
+    pretty,
+    dir,
+    makeEnv("custom", { FAKE_OUTPUT: '{"name": "rtk", "count": 3}' }),
+  )
+  expect(jsonWins).toBe(minified)
+  // Pipe returns the smallest result: pipe wins.
+  clearCalls()
+  const pipeWins = await compressOutput(GIT_STATUS, pretty, dir, makeEnv("shrink"))
+  expect(pipeWins).toBe(SHRUNK)
+})
+
+test("compress_pipe_failure_preserves_original_json", async () => {
+  const pretty = '{\n  "name": "rtk",\n  "count": 3\n}'
+  clearCalls()
+  expect(await compressOutput(GIT_STATUS, pretty, dir, makeEnv("fail"))).toBe(pretty)
+  expect(readCalls()).toHaveLength(1)
+  const envWithoutRtk: NodeJS.ProcessEnv = { ...process.env, PATH: emptyPathDir }
+  expect(await compressOutput(GIT_STATUS, pretty, dir, envWithoutRtk)).toBe(pretty)
+})

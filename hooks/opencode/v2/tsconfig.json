@@ -8,5 +8,5 @@
     "noEmit": true,
     "allowImportingTsExtensions": true
   },
-  "include": ["index.ts", "compress.ts", "*.test.ts"]
+  "include": ["index.ts", "compress.ts", "json.ts", "*.test.ts"]
 }
