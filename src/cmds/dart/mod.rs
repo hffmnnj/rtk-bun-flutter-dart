@@ -1,1 +1,1 @@
-automod::dir!(pub "src/cmds/dart");
+pub mod dart_cmd;

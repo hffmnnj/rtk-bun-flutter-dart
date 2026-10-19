@@ -1,1 +1,1 @@
-automod::dir!(pub "src/cmds/flutter");
+pub mod flutter_cmd;
