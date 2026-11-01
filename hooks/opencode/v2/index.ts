@@ -1,17 +1,20 @@
 import { Plugin } from "@opencode/plugin";
 import { compressOutput } from "./compress.ts";
 import { minifyJson } from "./json.ts";
+import { registerCodeModeTools } from "./tools.ts";
 
 // Native OpenCode V2 RTK plugin — output pruning ONLY.
 //
 // Safety boundary (by construction, not by convention):
-// - ONLY `tool.execute.after` is registered; inputs and permissions untouched.
+// - The only hook is `tool.execute.after`; inputs and permissions untouched.
 // - Shell output shrinks via `compressOutput` (only `rtk pipe` spawns);
 //   complex shell compacts JSON locally, never via autodetect.
 // - `execute` (CodeMode) minifies complete JSON text locally, no subprocess,
 //   never running the code; truncated results pass through.
 // - Adoption needs a verbatim content match plus strictly smaller UTF-8;
 //   metadata, exit/signal, notices, and structured outputs are preserved.
+// - Code Mode can explicitly compact captured text through `rtk.compress`;
+//   it never runs the command hint or changes another tool's returned value.
 type ShellInput = {
   readonly command?: unknown;
   readonly workdir?: unknown;
@@ -138,5 +141,6 @@ export default Plugin.define({
         // unexpected error the original output stands.
       }
     });
+    await registerCodeModeTools(ctx);
   },
 });

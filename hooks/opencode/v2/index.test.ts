@@ -51,6 +51,7 @@ let marker = ""
 let emptyPathDir = ""
 let savedPath: string | undefined
 let callback: ((event: any) => Promise<unknown>) | undefined
+const registeredTools: Array<{ name: string; options?: { namespace?: string; codemode?: boolean } }> = []
 
 // Each fake invocation appends an `argv:` line plus a `pwd` line, so the log
 // proves call count (exactly one pipe call, no retry) and the cwd the
@@ -129,6 +130,13 @@ beforeAll(async () => {
   const permissionHooks: string[] = []
   const fakeCtx: any = {
     tool: {
+      transform: async (register: (editor: {
+        namespace: (info: unknown) => void
+        add: (info: typeof registeredTools[number]) => void
+      }) => void) => {
+        register({ namespace: () => {}, add: (info) => registeredTools.push(info) })
+        return { dispose: async () => {} }
+      },
       hook: (name: string, cb: (event: any) => Promise<unknown>) => {
         toolHooks.push({ name, cb })
         return Promise.resolve({ dispose: async () => {} })
@@ -178,6 +186,9 @@ test("plugin_registers_only_tool_execute_after_hook", async () => {
   // Registration is asserted in beforeAll (it must hold before any behavior
   // test runs); this test keeps the guarantee visible per-behavior.
   requireCallback()
+  expect(registeredTools.map(({ name, options }) => ({ name, options }))).toEqual([
+    { name: "compress", options: { namespace: "rtk", codemode: true } },
+  ])
 })
 
 test("completed_shell_output_is_compressed_command_byte_identical", async () => {
