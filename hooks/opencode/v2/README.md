@@ -6,7 +6,9 @@ and losslessly compacts complete CodeMode JSON results. Original commands are ne
 ## Target
 
 - Load path: `file:///home/james/Documents/rtk-fork/hooks/opencode/v2`.
-- Dependency only: `@opencode/plugin` `2.0.32` (matches the live server; no core import).
+- Dependency only: `@opencode/plugin` `2.0.32` (no core import). The pin does
+  not necessarily match the live server (2.2.1 at last check); only the
+  promise-surface API used here is relied on.
 - Command-specific pipe filters require `rtk` in `PATH`; a missing binary
   preserves their original output. Local JSON compaction needs no subprocess.
 - Install/upgrade: point the loader at this path, keep the pinned
@@ -68,6 +70,44 @@ and losslessly compacts complete CodeMode JSON results. Original commands are ne
   `rtk proxy bash -c '...'`. In RTK 1.0.1, `proxy` is a compatible alias of
   `bypass`; neither filters output. No automatic rerun.
 
+## Explicit CodeMode tool (`rtk.compress`)
+
+Automatic `execute.after` compaction already handles CodeMode JSON results;
+scripts must keep the original data for further computation and call this
+tool only for the final displayed text. Do not paste huge captured output
+into generated tool input: compute first, then pass only the final string
+to compact.
+
+- Inside Code Mode, call `tools.rtk.compress({ text, command, exitCode: 0 })`
+  on the final text. Code Mode receives
+  `{ text, inputBytes, outputBytes, savedBytes }`; use the compacted `text`
+  as the final displayed value. Example: run the query,
+  keep the rows for filtering and aggregation, then compact last:
+
+  ```ts
+  const rows = await queryAll()
+  const total = rows.reduce((sum, row) => sum + row.amount, 0)
+  const text = JSON.stringify({ total, rows }, null, 2)
+  const compact = await tools.rtk.compress({ text })
+  return compact.text
+  ```
+
+  The original `rows` stay intact for the math above; only the returned
+  display string is compacted.
+
+- Without `command`, complete JSON objects/arrays are whitespace-minified
+  locally (the same lossless `minifyJson`; number and string lexemes
+  preserved). With a nonempty `command` plus `exitCode: 0`, the same
+  `rtk pipe` hint filtering applies as for shell output.
+- `command` is only a filter hint: it is never executed. A failed
+  (`exitCode !== 0`) or command-hinted unknown (missing `exitCode`) result
+  stays raw, exactly as captured. No generic automatic MCP pruning is introduced: only
+  this explicit call compacts, alongside the existing automatic
+  `execute.after` JSON exception.
+- `RTK_DISABLED=1` preserves text verbatim. As with automatic pipe
+  filtering, `rtk gain` does not currently track these savings; the tool's
+  own `inputBytes`/`outputBytes`/`savedBytes` fields report the single call.
+
 ## Why output-only
 
 Command-rewriting hooks run before native shell permissions. Filtering
@@ -76,7 +116,7 @@ parser duplication entirely, while preserving the original command's execution.
 
 ## Verification
 
-- Run `bun test` (58 tests) and `bun run typecheck` in this directory.
+- Run `bun test` and `bun run typecheck` in this directory.
 - Limitation: `rtk pipe` does not currently track stats (raw `proxy` still does).
 - Private audit corpus/data/results (e.g. `tools.jsonl`,
   `comparison.json` under `/var/tmp/james/opencode/`) are never committed.
